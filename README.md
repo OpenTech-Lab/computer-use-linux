@@ -178,4 +178,4 @@ Run it on a machine you are willing to let an agent control.
 
 ## License
 
-Not yet specified.
+[MIT](LICENSE) © 2026 OpenTech-Lab
