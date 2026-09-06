@@ -5,27 +5,41 @@ choose the backend deliberately before connecting an agent.
 
 ## Python runtime
 
-Use the system CPython 3.14 and create the virtual environment with system site-packages:
-
 ```bash
+git clone https://github.com/OpenTech-Lab/computer-use-linux.git
+cd computer-use-linux
 ./scripts/bootstrap.sh
-make setup
 ./.venv/bin/cul doctor
 ```
 
-`pyproject.toml` requires Python 3.14 or newer. The supported bootstrap command is equivalent to:
+`bootstrap.sh` finds the right interpreter for you. **There is no required Python version** beyond
+3.11+ — the real constraint is PyGObject.
+
+`gi` is a compiled distribution package built against your system's GLib, and it loads that
+system's introspection typelibs (Gio, GStreamer, AT-SPI). It therefore **cannot be installed from
+PyPI**, and `pip install PyGObject` will not fix a missing `gi`. The venv must be created from the
+**system interpreter that ships PyGObject**, with `--system-site-packages` — whichever version that
+happens to be on your distribution:
+
+| Distribution | System Python | Install PyGObject with |
+| --- | --- | --- |
+| Ubuntu 24.04 | 3.12 | `sudo apt install python3-gi gir1.2-atspi-2.0 gstreamer1.0-pipewire` |
+| Ubuntu 26.04 | 3.14 | same as above |
+| Debian 13 | 3.13 | same as above |
+| Fedora 41+ | 3.13 | `sudo dnf install python3-gobject gstreamer1-plugins-base` |
+| Arch | current | `sudo pacman -S python-gobject at-spi2-core gst-plugin-pipewire` |
+| openSUSE | varies | `sudo zypper install python3-gobject gstreamer-plugins-base` |
+
+If your system Python lives somewhere unusual, point at it explicitly:
 
 ```bash
-uv venv --python /usr/bin/python3.14 --system-site-packages .venv
+CUL_PYTHON=/usr/bin/python3.12 ./scripts/bootstrap.sh
 ```
 
-PyGObject is not a normal pip-only dependency for this project. Its `gi` bindings are compiled
-against the distribution's GLib/GObject libraries and load the matching installed introspection
-typelibs (including Gio, GStreamer, and AT-SPI). The prepared runtime therefore gets PyGObject
-from the operating system through `--system-site-packages`; do not try to repair a missing `gi`
-import with `pip install PyGObject`. Use the matching distribution packages and recreate the venv
-with `/usr/bin/python3.14` if necessary. `python-xlib`, NumPy, Pillow, and MCP are installed into
-the venv by the project bootstrap.
+Beware of version managers. If `python3` resolves to mise, pyenv, asdf, conda or a Homebrew build,
+that interpreter will **not** have `gi`, and a venv built from it cannot work no matter what you
+pip-install. `bootstrap.sh` deliberately searches `/usr/bin` for a system interpreter rather than
+trusting `PATH`.
 
 ## Optional system packages
 
