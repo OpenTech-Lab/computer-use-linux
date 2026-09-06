@@ -15,6 +15,7 @@ from typing import Any
 
 from ..errors import BackendUnavailable
 from . import ActionSpec, AdapterBase, register
+from ._bridge_security import public_record, read_json, write_private_json
 from ._process import start_ticks
 
 
@@ -25,11 +26,7 @@ def _bool(value: Any) -> bool:
 
 
 def _record(path: Path) -> dict[str, Any] | None:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else None
-    except (OSError, ValueError, TypeError):
-        return None
+    return read_json(path)
 
 
 @register
@@ -43,6 +40,15 @@ class GodotAdapter(AdapterBase):
         super().__init__(session=session, config=config)
         self._state_file = self.config.state_dir / "godot.json"
         self._plugin = Path(__file__).resolve().parents[3] / "extras" / "godot-plugin" / "addons" / "cul_bridge"
+
+    def _write_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        current = _record(self._state_file) or {}
+        merged = {**record}
+        token = current.get("token")
+        if isinstance(token, str) and token:
+            merged["token"] = token
+        write_private_json(self._state_file, merged)
+        return merged
 
     def _binary(self, requested: str | None = None) -> str:
         candidate = requested or os.environ.get("CUL_GODOT_BINARY")
@@ -59,7 +65,7 @@ class GodotAdapter(AdapterBase):
             return path
         raise BackendUnavailable("Godot executable not found; set CUL_GODOT_BINARY")
 
-    def _managed(self, record: dict[str, Any] | None = None) -> bool:
+    def _managed_process(self, record: dict[str, Any] | None = None) -> bool:
         record = record or _record(self._state_file)
         if not record:
             return False
@@ -79,14 +85,25 @@ class GodotAdapter(AdapterBase):
         project = str(record.get("project") or "")
         return "--editor" in command and bool(project) and project in command
 
+    def _managed(self, record: dict[str, Any] | None = None) -> bool:
+        record = record or _record(self._state_file)
+        if not self._managed_process(record):
+            return False
+        token = record.get("token") if record else None
+        return isinstance(token, str) and bool(token)
+
     def _request(self, action: str, **payload: Any) -> dict[str, Any]:
         record = _record(self._state_file)
         if not record or not self._managed(record):
             raise BackendUnavailable("no managed Godot editor bridge is running; use headless mode or `cul app godot launch`")
+        token = record.get("token")
+        if not isinstance(token, str) or not token:
+            raise BackendUnavailable("Godot bridge authentication state is unavailable")
         try:
             with socket.create_connection(("127.0.0.1", int(record["port"])), timeout=8.0) as connection:
                 connection.settimeout(8.0)
-                connection.sendall((json.dumps({"action": action, **payload}, separators=(",", ":")) + "\n").encode("utf-8"))
+                request = {"action": action, **payload, "token": token}
+                connection.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8"))
                 data = b""
                 while not data.endswith(b"\n"):
                     chunk = connection.recv(65536)
@@ -97,6 +114,8 @@ class GodotAdapter(AdapterBase):
                         raise BackendUnavailable("Godot bridge response is too large")
         except OSError as exc:
             raise BackendUnavailable(f"Godot bridge connection failed: {exc}") from exc
+        if not data:
+            raise BackendUnavailable("Godot bridge closed the connection")
         try:
             value = json.loads(data.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
@@ -160,7 +179,7 @@ class GodotAdapter(AdapterBase):
     def launch(self, **kwargs: Any) -> dict[str, Any]:
         if self.detect():
             record = _record(self._state_file) or {}
-            return {"ok": True, "already_running": True, "pid": record.get("pid"), "port": record.get("port"), "project": record.get("project")}
+            return {"ok": True, "already_running": True, **public_record(record)}
         project = Path(str(kwargs.get("project") or "")).expanduser().resolve()
         if not project.is_dir():
             raise BackendUnavailable(f"Godot project directory does not exist: {project}")
@@ -169,12 +188,15 @@ class GodotAdapter(AdapterBase):
         if not self._plugin.is_dir():
             raise BackendUnavailable(f"Godot bridge plugin is missing: {self._plugin}")
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            self._state_file.unlink()
         command = [binary]
         if _bool(kwargs.get("headless", False)):
             command.append("--headless")
         command.extend(["--editor", "--path", str(project)])
         env = os.environ.copy()
         env["CUL_GODOT_PORT"] = str(port)
+        env["CUL_GODOT_STATE_FILE"] = str(self._state_file)
         log_path = self.config.state_dir / "godot.log"
         log_handle = log_path.open("ab")
         try:
@@ -189,7 +211,6 @@ class GodotAdapter(AdapterBase):
         finally:
             log_handle.close()
         record = {"pid": process.pid, "port": port, "project": str(project), "binary": binary, "plugin": str(self._plugin), "start_ticks": start_ticks(process.pid)}
-        self._state_file.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
         # The plugin is project-local and must be enabled in project.godot.  A launch that does
         # not expose a socket is still useful as a normal editor launch, so return its state
         # instead of misreporting a ready bridge.
@@ -197,10 +218,21 @@ class GodotAdapter(AdapterBase):
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise BackendUnavailable(f"Godot exited during launch; see {log_path}")
-            if self.detect():
-                return {"ok": True, **record, "bridge": "ready"}
+            current = _record(self._state_file)
+            token = current.get("token") if current else None
+            if isinstance(token, str) and token:
+                merged = {**record, "token": token}
+                self._write_record(merged)
+                if self.detect():
+                    return {"ok": True, **public_record(_record(self._state_file) or merged), "bridge": "ready"}
             time.sleep(0.1)
-        return {"ok": True, **record, "bridge": "not detected", "warning": "enable addons/cul_bridge in the Godot project for live editor actions"}
+        self._write_record(record)
+        return {
+            "ok": True,
+            **public_record(_record(self._state_file) or record),
+            "bridge": "not detected",
+            "warning": "enable addons/cul_bridge in the Godot project for live editor actions",
+        }
 
     @staticmethod
     def _script_body(expr: str) -> str:
@@ -254,7 +286,7 @@ class GodotAdapter(AdapterBase):
 
     def _stop(self) -> dict[str, Any]:
         record = _record(self._state_file)
-        if not record or not self._managed(record):
+        if not record or not self._managed_process(record):
             if record:
                 with contextlib.suppress(OSError):
                     self._state_file.unlink()

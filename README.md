@@ -70,15 +70,29 @@ Backends are pluggable and selected by runtime capability detection:
 
 ### App adapters
 
-| Application | Control path |
-| --- | --- |
-| Chrome / Chromium | Chrome DevTools Protocol |
-| VSCode | `code` CLI + companion extension / AT-SPI |
-| Godot 4 | `--headless` / `--script` + editor plugin socket |
-| Blender | Python API over a socket addon |
-| GTK / Qt apps | AT-SPI2 semantic tree |
+All five are implemented and exposed as both `cul app <name> <action>` and MCP
+`app_<name>_<action>` tools.
 
-New applications are added by implementing the adapter interface, without touching core.
+| Adapter | Control path | Actions |
+| --- | --- | --- |
+| `browser` | Chrome DevTools Protocol | `launch` `navigate` `eval` `click_selector` `text` `screenshot` `wait_for` `status` `stop` |
+| `godot` | `--headless --script` + editor socket | `launch` `run_scene` `eval_gdscript` `editor_command` `status` `stop` |
+| `blender` | `bpy` on Blender's main thread | `launch` `run_python` `scene_info` `viewport_screenshot` `status` `stop` |
+| `vscode` | `code` CLI + AT-SPI | `launch` `open` `goto` `diff` `command` `windows` `tree` `read_text` `invoke_action` |
+| `atspi_generic` | AT-SPI2 tree + `do_action()` | `windows` `tree` `read_text` `focus` `actions` `invoke_action` |
+
+Adapters register through a decorator, so **adding an application requires no change to core**.
+Actions that execute arbitrary code (`eval`, `run_python`, `eval_gdscript`) are confirmation-gated.
+
+```bash
+cul app list
+cul app browser launch
+cul app browser navigate --url https://example.com
+cul app browser text
+cul app blender scene_info
+cul app godot eval_gdscript --confirm --expr "Engine.get_version_info().string"
+cul app vscode windows
+```
 See [docs/ADAPTERS.md](docs/ADAPTERS.md) for the precedence rule, action list, isolation, and
 bridge lifecycle.
 
@@ -133,6 +147,23 @@ This tool drives a **real** desktop with **real** input devices. It is built wit
 - Opt-in confirmation for destructive actions
 - Screenshot redaction for regions that should never reach a model
 
+### The agent shares your cursor
+
+On a single seat, Wayland and X11 provide **one logical pointer**. When the agent moves the mouse,
+it moves *your* mouse — you cannot comfortably use the machine at the same time. This is a property
+of the display server, not a limitation of this tool.
+
+Two things reduce it:
+
+- **Prefer adapters.** `cul app ...` actions drive applications through their own APIs and
+  `do_action()`, so they never touch the pointer at all. Most useful work needs no cursor.
+- **A virtual surface gives the agent its own pointer.** `Mutter.ScreenCast.RecordVirtual`, bound to
+  a RemoteDesktop session, yields a surface whose pointer is genuinely independent — verified: the
+  virtual pointer moved to its commanded coordinate while the real cursor stayed put, and no monitor
+  was added to the desktop layout. It is not yet wired into the public API because placing ordinary
+  application windows onto that surface is still an open question; a nested compositor is the
+  fallback for full isolation.
+
 Run it on a machine you are willing to let an agent control.
 
 ## Roadmap
@@ -141,6 +172,7 @@ Run it on a machine you are willing to let an agent control.
 - [x] MCP server + CLI surface
 - [x] Minimal AT-SPI window/focus/readback foundation
 - [x] App adapters: browser, VSCode, Godot, Blender, generic AT-SPI
+- [ ] Independent agent pointer via a virtual surface or nested compositor
 - [ ] X11 and nested/headless backends
 - [ ] Packaging and install docs
 

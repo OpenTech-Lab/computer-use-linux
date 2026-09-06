@@ -33,6 +33,9 @@ markers = [
 [tool.ruff]
 line-length = 220
 target-version = "py314"
+# reference-probes/ are throwaway scripts kept verbatim as executed evidence
+# for docs/ENVIRONMENT.md; they are deliberately terse and are not packaged.
+exclude = ["reference-probes"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]

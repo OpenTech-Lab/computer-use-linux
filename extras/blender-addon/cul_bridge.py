@@ -6,12 +6,17 @@ Blender's main thread, which is the only safe place for most Blender API operati
 
 from __future__ import annotations
 
+import atexit
 import contextlib
+import hmac
 import io
 import json
 import os
 import queue
+import secrets
 import socket
+import stat
+import struct
 import threading
 import traceback
 from contextlib import redirect_stdout
@@ -20,11 +25,12 @@ from typing import Any
 
 import bpy  # type: ignore
 
-
-_PORT = int(os.environ.get("CUL_BLENDER_PORT", "9876"))
 _REQUESTS: queue.Queue[tuple[dict[str, Any], queue.Queue[dict[str, Any]]]] = queue.Queue()
 _STOP = threading.Event()
 _SERVER: socket.socket | None = None
+_SOCKET_PATH: Path | None = None
+_STATE_FILE: Path | None = None
+_TOKEN: str | None = None
 
 
 def _safe(value: Any) -> Any:
@@ -49,6 +55,89 @@ def _scene_info() -> dict[str, Any]:
             for obj in bpy.context.scene.objects
         ],
     }
+
+
+def _ensure_private_directory(path: Path) -> Path:
+    path = path.expanduser()
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata = path.stat()
+    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise RuntimeError(f"Blender bridge directory is not owner-only: {path}")
+    return path
+
+
+def _socket_path() -> Path:
+    configured = os.environ.get("CUL_BLENDER_SOCKET")
+    if configured:
+        path = Path(configured).expanduser()
+    else:
+        runtime = os.environ.get("XDG_RUNTIME_DIR")
+        base = Path(runtime).expanduser() if runtime else Path.home() / ".local" / "state" / "computer-use-linux"
+        path = base / f"cul-blender-{os.getpid()}.sock"
+    _ensure_private_directory(path.parent)
+    return path
+
+
+def _state_file() -> Path:
+    configured = os.environ.get("CUL_BLENDER_STATE_FILE")
+    if configured:
+        return Path(configured).expanduser()
+    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")).expanduser()
+    return state_home / "computer-use-linux" / "blender.json"
+
+
+def _read_state(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _write_state(path: Path, values: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    encoded = json.dumps(values, sort_keys=True, separators=(",", ":"))
+    descriptor = os.open(str(path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+    metadata = path.stat()
+    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise RuntimeError("Blender bridge state file is not owner-only")
+
+
+def _remove_stale_socket(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(metadata.st_mode):
+        raise RuntimeError(f"Blender bridge path is not a socket: {path}")
+    path.unlink()
+
+
+def _peer_uid_matches(connection: socket.socket) -> bool:
+    try:
+        raw = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", raw)
+    except (AttributeError, OSError, struct.error):
+        return False
+    return uid == os.geteuid()
+
+
+def _authorized(request: dict[str, Any]) -> bool:
+    supplied = request.get("token")
+    if not isinstance(supplied, str):
+        supplied = ""
+    expected = _TOKEN or ""
+    return hmac.compare_digest(supplied, expected)
 
 
 def _handle(request: dict[str, Any]) -> dict[str, Any]:
@@ -80,13 +169,9 @@ def _handle(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def _listener() -> None:
-    global _SERVER
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    _SERVER = server
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("127.0.0.1", _PORT))
-    server.listen(8)
-    server.settimeout(0.5)
+    server = _SERVER
+    if server is None:
+        return
     while not _STOP.is_set():
         try:
             connection, _address = server.accept()
@@ -95,6 +180,8 @@ def _listener() -> None:
         except OSError:
             break
         with connection:
+            if not _peer_uid_matches(connection):
+                continue
             connection.settimeout(10.0)
             file = connection.makefile("rb")
             try:
@@ -102,21 +189,21 @@ def _listener() -> None:
                     try:
                         request = json.loads(line.decode("utf-8"))
                         if not isinstance(request, dict):
-                            raise ValueError("request must be an object")
-                    except Exception as exc:
-                        response = {"ok": False, "error": f"invalid request: {exc}"}
-                    else:
-                        responses: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
-                        _REQUESTS.put((request, responses))
-                        try:
-                            response = responses.get(timeout=30.0)
-                        except queue.Empty:
-                            response = {"ok": False, "error": "Blender main thread did not answer in 30 seconds"}
+                            break
+                    except (UnicodeDecodeError, ValueError, TypeError):
+                        break
+                    if not _authorized(request):
+                        break
+                    request.pop("token", None)
+                    responses: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+                    _REQUESTS.put((request, responses))
+                    try:
+                        response = responses.get(timeout=30.0)
+                    except queue.Empty:
+                        response = {"ok": False, "error": "Blender main thread did not answer in 30 seconds"}
                     connection.sendall((json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8"))
             finally:
                 file.close()
-    with contextlib.suppress(OSError):
-        server.close()
 
 
 def _pump() -> float:
@@ -132,7 +219,44 @@ def _pump() -> float:
     return 0.05
 
 
+def _shutdown() -> None:
+    _STOP.set()
+    if _SERVER is not None:
+        with contextlib.suppress(OSError):
+            _SERVER.close()
+    if _SOCKET_PATH is not None:
+        with contextlib.suppress(OSError):
+            _SOCKET_PATH.unlink()
+    if _STATE_FILE is not None:
+        state = _read_state(_STATE_FILE)
+        if state.get("pid") == os.getpid():
+            with contextlib.suppress(OSError):
+                _STATE_FILE.unlink()
+
+
 def _start() -> None:
+    global _SERVER, _SOCKET_PATH, _STATE_FILE, _TOKEN
+    _SOCKET_PATH = _socket_path()
+    _STATE_FILE = _state_file()
+    _TOKEN = secrets.token_urlsafe(32)
+    _remove_stale_socket(_SOCKET_PATH)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(str(_SOCKET_PATH))
+        os.chmod(_SOCKET_PATH, 0o600)
+        server.listen(8)
+    except Exception:
+        with contextlib.suppress(OSError):
+            server.close()
+        with contextlib.suppress(OSError):
+            _SOCKET_PATH.unlink()
+        raise
+    server.settimeout(0.5)
+    _SERVER = server
+    state = _read_state(_STATE_FILE)
+    state.update({"pid": os.getpid(), "socket": str(_SOCKET_PATH), "token": _TOKEN})
+    _write_state(_STATE_FILE, state)
+    atexit.register(_shutdown)
     thread = threading.Thread(target=_listener, name="cul-blender-bridge", daemon=True)
     thread.start()
     bpy.app.timers.register(_pump, first_interval=0.05, persistent=True)

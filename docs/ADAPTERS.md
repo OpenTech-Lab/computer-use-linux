@@ -57,8 +57,18 @@ Blender `run_python`, Godot `eval_gdscript`/`eval`, and browser `eval` are confi
 same `confirm=true` / `--confirm` policy used by the core. The gate runs before a bridge or
 headless subprocess is reached. A failed or omitted confirmation never executes the expression.
 
-The Blender and Godot sockets bind only to `127.0.0.1`; the VSCode companion uses a Unix-domain
-socket. Socket bridges are optional and their headless/native fallbacks remain usable without
+The optional bridges use a shared local-authentication discipline:
+
+* Blender uses an `AF_UNIX` socket named `cul-blender-<id>.sock` under `XDG_RUNTIME_DIR` (or the
+  owner-only state fallback), verifies `SO_PEERCRED`, and requires a per-launch bearer token.
+* Godot must bind explicitly to `127.0.0.1`; its per-launch token is stored in a verified `0600`
+  state file and is compared in constant time before any action is dispatched.
+* The VSCode companion uses a Unix-domain socket, an owner-only `0700` parent and `0600` socket,
+  plus the same per-launch token handshake.
+
+All bridge state files are written owner-only, stale socket/state records are replaced on the next
+launch, unauthorized requests are closed before dispatch, and tokens are never included in action
+logs, responses, launch results, or error text. The headless/native fallbacks remain usable without
 installing Python packages.
 
 ## Managed bridge lifecycle

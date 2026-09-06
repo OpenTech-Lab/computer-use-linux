@@ -15,6 +15,7 @@ from typing import Any
 from ..errors import BackendUnavailable
 from ..windows.atspi import AtspiWindowSource, atspi_probe
 from . import ActionSpec, AdapterBase, register
+from ._bridge_security import ensure_private_directory, read_json, write_private_json
 
 
 def _bool(value: Any) -> bool:
@@ -35,6 +36,18 @@ class VscodeAdapter(AdapterBase):
         self._state_file = self.config.state_dir / "vscode.json"
         self._extension = Path(__file__).resolve().parents[3] / "extras" / "vscode-extension"
 
+    def _record(self) -> dict[str, Any] | None:
+        return read_json(self._state_file)
+
+    def _write_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        current = self._record() or {}
+        merged = {**record}
+        token = current.get("token")
+        if isinstance(token, str) and token:
+            merged["token"] = token
+        write_private_json(self._state_file, merged)
+        return merged
+
     def _binary(self, requested: str | None = None) -> str:
         candidate = requested or os.environ.get("CUL_VSCODE_BINARY") or "code"
         resolved = shutil.which(candidate) or candidate
@@ -54,19 +67,28 @@ class VscodeAdapter(AdapterBase):
     def _socket_path(self) -> Path:
         configured = os.environ.get("CUL_VSCODE_SOCKET")
         if configured:
-            return Path(configured).expanduser()
+            path = Path(configured).expanduser()
+            ensure_private_directory(path.parent)
+            return path
         runtime = os.environ.get("XDG_RUNTIME_DIR")
-        return Path(runtime).expanduser() / "cul-vscode.sock" if runtime else self.config.state_dir / "vscode.sock"
+        base = Path(runtime).expanduser() if runtime else self.config.state_dir
+        ensure_private_directory(base)
+        return base / "cul-vscode.sock"
 
     def _bridge_request(self, action: str, **payload: Any) -> dict[str, Any]:
         path = self._socket_path()
         if not path.exists():
             raise BackendUnavailable(f"VSCode bridge socket is not available: {path}")
+        record = self._record()
+        token = record.get("token") if record else None
+        if not isinstance(token, str) or not token:
+            raise BackendUnavailable("VSCode bridge authentication state is unavailable")
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(8.0)
                 connection.connect(str(path))
-                connection.sendall((json.dumps({"action": action, **payload}, separators=(",", ":")) + "\n").encode("utf-8"))
+                request = {"action": action, **payload, "token": token}
+                connection.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8"))
                 data = b""
                 while not data.endswith(b"\n"):
                     chunk = connection.recv(65536)
@@ -75,6 +97,8 @@ class VscodeAdapter(AdapterBase):
                     data += chunk
         except OSError as exc:
             raise BackendUnavailable(f"VSCode bridge connection failed: {exc}") from exc
+        if not data:
+            raise BackendUnavailable("VSCode bridge closed the connection")
         try:
             result = json.loads(data.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
@@ -184,16 +208,40 @@ class VscodeAdapter(AdapterBase):
             command.append(str(Path(path).expanduser()))
         env = os.environ.copy()
         with_bridge = _bool(kwargs.get("with_bridge", False))
+        self.config.state_dir.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            self._state_file.unlink()
         if with_bridge:
             socket_path = self._socket_path()
             env["CUL_VSCODE_SOCKET"] = str(socket_path)
+            env["CUL_VSCODE_STATE_FILE"] = str(self._state_file)
             if self._extension.is_dir():
                 command.append(f"--extensionDevelopmentPath={self._extension}")
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, start_new_session=True)
-        self.config.state_dir.mkdir(parents=True, exist_ok=True)
-        self._state_file.write_text(json.dumps({"pid": process.pid, "command": command, "bridge": with_bridge, "socket": str(self._socket_path())}, sort_keys=True), encoding="utf-8")
-        time.sleep(0.5)
-        return {"ok": True, "pid": process.pid, "command": command, "bridge": self._socket_path().exists() if with_bridge else False}
+        state = {"pid": process.pid, "command": command, "bridge": with_bridge, "socket": str(self._socket_path())}
+        if with_bridge:
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    break
+                current = self._record()
+                token = current.get("token") if current else None
+                if isinstance(token, str) and token:
+                    self._write_record({**state, "token": token})
+                else:
+                    time.sleep(0.1)
+                    continue
+                try:
+                    self._bridge_request("status")
+                    return {"ok": True, "pid": process.pid, "command": command, "bridge": True}
+                except BackendUnavailable:
+                    time.sleep(0.1)
+        else:
+            self._write_record(state)
+            time.sleep(0.5)
+        if with_bridge:
+            self._write_record(state)
+        return {"ok": True, "pid": process.pid, "command": command, "bridge": False}
 
     def _focus_one(self) -> str:
         windows = self._windows()
@@ -263,4 +311,3 @@ class VscodeAdapter(AdapterBase):
                 action_name = str(raw_name)
             return source.invoke_action(str(kwargs["window_id"]), action_name, path=kwargs.get("path") or [])
         raise BackendUnavailable(f"unsupported VSCode adapter action: {action}")
-

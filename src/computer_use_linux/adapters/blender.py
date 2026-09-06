@@ -16,6 +16,7 @@ from typing import Any
 
 from ..errors import BackendUnavailable
 from . import ActionSpec, AdapterBase, register
+from ._bridge_security import ensure_private_directory, public_record, read_json, write_private_json
 from ._process import start_ticks
 
 
@@ -26,11 +27,7 @@ def _bool(value: Any) -> bool:
 
 
 def _read_record(path: Path) -> dict[str, Any] | None:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else None
-    except (OSError, ValueError, TypeError):
-        return None
+    return read_json(path)
 
 
 @register
@@ -63,14 +60,46 @@ class BlenderAdapter(AdapterBase):
     def _record(self) -> dict[str, Any] | None:
         return _read_record(self._state_file)
 
-    def _managed(self, record: dict[str, Any] | None = None) -> bool:
+    @staticmethod
+    def _socket_path(identifier: str) -> Path:
+        configured = os.environ.get("CUL_BLENDER_SOCKET")
+        if configured:
+            path = Path(configured).expanduser()
+            ensure_private_directory(path.parent)
+            return path
+        runtime = os.environ.get("XDG_RUNTIME_DIR")
+        base = Path(runtime).expanduser() if runtime else Path.home() / ".local" / "state" / "computer-use-linux"
+        ensure_private_directory(base)
+        return base / f"cul-blender-{identifier}.sock"
+
+    def _write_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        current = self._record() or {}
+        merged = {**record}
+        token = current.get("token")
+        if isinstance(token, str) and token:
+            merged["token"] = token
+        write_private_json(self._state_file, merged)
+        return merged
+
+    @staticmethod
+    def _cleanup_socket(record: dict[str, Any] | None) -> None:
+        if not record:
+            return
+        socket_name = record.get("socket")
+        if socket_name:
+            with contextlib.suppress(OSError):
+                Path(str(socket_name)).unlink()
+
+    def _managed_process(self, record: dict[str, Any] | None = None) -> bool:
         record = record or self._record()
         if not record:
             return False
         try:
             pid = int(record["pid"])
-            port = int(record["port"])
+            socket_name = str(record["socket"])
             os.kill(pid, 0)
+            if not socket_name:
+                return False
         except (KeyError, TypeError, ValueError, OSError):
             return False
         try:
@@ -80,17 +109,28 @@ class BlenderAdapter(AdapterBase):
         expected_start = record.get("start_ticks")
         if expected_start is not None and start_ticks(pid) != int(expected_start):
             return False
-        return str(self._bridge) in command and int(record.get("port", 0)) == port
+        return str(self._bridge) in command and socket_name == str(record.get("socket", ""))
+
+    def _managed(self, record: dict[str, Any] | None = None) -> bool:
+        record = record or self._record()
+        if not self._managed_process(record):
+            return False
+        token = record.get("token") if record else None
+        return isinstance(token, str) and bool(token)
 
     def _request(self, action: str, *, timeout: float = 8.0, **payload: Any) -> dict[str, Any]:
         record = self._record()
         if not record or not self._managed(record):
             raise BackendUnavailable("no managed Blender bridge is running; run `cul app blender launch` first")
-        address = ("127.0.0.1", int(record["port"]))
-        request = {"action": action, **payload}
+        token = record.get("token")
+        if not isinstance(token, str) or not token:
+            raise BackendUnavailable("Blender bridge authentication state is unavailable")
+        socket_name = str(record["socket"])
+        request = {"action": action, **payload, "token": token}
         try:
-            with socket.create_connection(address, timeout=timeout) as connection:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(timeout)
+                connection.connect(socket_name)
                 connection.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8"))
                 line = b""
                 while not line.endswith(b"\n"):
@@ -102,6 +142,8 @@ class BlenderAdapter(AdapterBase):
                         raise BackendUnavailable("Blender bridge response is too large")
         except OSError as exc:
             raise BackendUnavailable(f"Blender bridge connection failed: {exc}") from exc
+        if not line:
+            raise BackendUnavailable("Blender bridge closed the connection")
         try:
             value = json.loads(line.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
@@ -126,7 +168,7 @@ class BlenderAdapter(AdapterBase):
                 "Launch Blender with the computer-use bridge addon.",
                 parameters={
                     "blender": {"type": "string", "default": "", "description": "Absolute Blender executable override."},
-                    "port": {"type": "integer", "default": 9876, "description": "Loopback bridge port."},
+                    "port": {"type": "integer", "default": 9876, "description": "Deprecated compatibility option; the bridge uses a private Unix socket."},
                     "background": {"type": "boolean", "default": False, "description": "Launch without a visible Blender window."},
                     "file": {"type": "string", "default": "", "description": "Optional .blend file to open."},
                 },
@@ -158,12 +200,16 @@ class BlenderAdapter(AdapterBase):
     def launch(self, **kwargs: Any) -> dict[str, Any]:
         if self.detect():
             record = self._record() or {}
-            return {"ok": True, "already_running": True, "pid": record.get("pid"), "port": record.get("port"), "binary": record.get("binary")}
+            return {"ok": True, "already_running": True, **public_record(record)}
         if not self._bridge.is_file():
             raise BackendUnavailable(f"Blender bridge addon is missing: {self._bridge}")
         binary = self._binary(str(kwargs.get("blender") or "") or None)
-        port = int(kwargs.get("port", os.environ.get("CUL_BLENDER_PORT", 9876)))
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
+        stale_record = self._record()
+        self._cleanup_socket(stale_record)
+        with contextlib.suppress(OSError):
+            self._state_file.unlink()
+        socket_name = self._socket_path(f"{os.getpid()}-{time.time_ns()}")
         command = [binary, "--factory-startup"]
         if _bool(kwargs.get("background", False)):
             command.append("--background")
@@ -172,7 +218,8 @@ class BlenderAdapter(AdapterBase):
             command.append(str(Path(file).expanduser()))
         command.extend(["--python", str(self._bridge)])
         env = os.environ.copy()
-        env["CUL_BLENDER_PORT"] = str(port)
+        env["CUL_BLENDER_SOCKET"] = str(socket_name)
+        env["CUL_BLENDER_STATE_FILE"] = str(self._state_file)
         log_path = self.config.state_dir / "blender.log"
         log_handle = log_path.open("ab")
         try:
@@ -186,17 +233,26 @@ class BlenderAdapter(AdapterBase):
             )
         finally:
             log_handle.close()
-        record = {"pid": process.pid, "port": port, "binary": binary, "bridge": str(self._bridge), "start_ticks": start_ticks(process.pid)}
-        self._state_file.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+        record = {"pid": process.pid, "socket": str(socket_name), "binary": binary, "bridge": str(self._bridge), "start_ticks": start_ticks(process.pid)}
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             if process.poll() is not None:
+                self._cleanup_socket(record)
                 raise BackendUnavailable(f"Blender exited during bridge launch; see {log_path}")
-            try:
-                self._request("status")
-                return {"ok": True, **record, "bridge": "ready"}
-            except BackendUnavailable:
-                time.sleep(0.1)
+            current = self._record()
+            token = current.get("token") if current else None
+            if isinstance(token, str) and token:
+                merged = {**record, "token": token}
+                self._write_record(merged)
+                try:
+                    self._request("status")
+                    return {"ok": True, **public_record(self._record() or merged), "bridge": "ready"}
+                except BackendUnavailable:
+                    pass
+            time.sleep(0.1)
+        self._cleanup_socket(record)
+        with contextlib.suppress(OSError):
+            self._state_file.unlink()
         raise BackendUnavailable(f"timed out waiting for Blender bridge; see {log_path}")
 
     def _run_headless(self, expression: str, *, timeout: float = 20.0, binary: str | None = None) -> dict[str, Any]:
@@ -236,13 +292,14 @@ class BlenderAdapter(AdapterBase):
                 "running": self.detect(),
                 "managed": bool(record and self._managed(record)),
                 "pid": record.get("pid") if record else None,
-                "port": record.get("port") if record else None,
+                "socket": record.get("socket") if record else None,
                 "binary": record.get("binary") if record else None,
             }
         if action == "stop":
             record = self._record()
-            if not record or not self._managed(record):
+            if not record or not self._managed_process(record):
                 if record:
+                    self._cleanup_socket(record)
                     with contextlib.suppress(OSError):
                         self._state_file.unlink()
                 return {"ok": True, "running": False}
@@ -259,6 +316,7 @@ class BlenderAdapter(AdapterBase):
             else:
                 with contextlib.suppress(OSError):
                     os.kill(pid, signal.SIGKILL)
+            self._cleanup_socket(record)
             with contextlib.suppress(OSError):
                 self._state_file.unlink()
             return {"ok": True, "running": False, "pid": pid}
