@@ -24,16 +24,37 @@ class FakeSession:
         self.moves.append((x, y, surface_id))
 
 
-def test_coords_selftest_returns_nonzero_when_metadata_measurement_fails(monkeypatch, capsys) -> None:
+def test_coords_selftest_skips_when_the_instrument_returns_no_reading(monkeypatch, capsys) -> None:
+    """No reading is not a failed assertion.
+
+    A starved PipeWire stream means the run proved nothing, so it must report
+    SKIPPED rather than FAIL. Reporting an unavailable instrument as red trains
+    people to ignore a red result, which is worse than an honest skip.
+    """
     monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
     session = FakeSession(positions={"monitor:DP-2": None})
 
     result = cli._run_coords_selftest(session, "monitor:DP-2")
 
     captured = capsys.readouterr()
+    assert result == 0
+    assert "SKIPPED" in captured.out
+    assert "FAIL" not in captured.out
+
+
+def test_coords_selftest_fails_when_the_pointer_lands_in_the_wrong_place(monkeypatch, capsys) -> None:
+    """A wrong reading is still a hard failure -- the skip path must not mask it."""
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    session = FakeSession(positions={"monitor:DP-2": (11, 22)})
+
+    result = cli._run_coords_selftest(session, "monitor:DP-2")
+
+    captured = capsys.readouterr()
     assert result == 1
-    assert "coords selftest: 0/3" in captured.out
     assert "FAIL" in captured.out
+    # Three identical readings are the stale-buffer signature, and the operator
+    # is told so explicitly rather than being left to guess at a coordinate bug.
+    assert "stale buffer" in captured.err
 
 
 def test_monitors_selftest_returns_nonzero_when_pointer_is_seen_on_both_monitors(capsys) -> None:

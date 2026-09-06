@@ -201,9 +201,11 @@ class GnomeMutterBackend:
         self._nodes: dict[str, int] = {}
         self._metadata_streams: dict[str, str] = {}
         self._metadata_nodes: dict[str, int] = {}
+        self._cursor_move_generation = 0
+        self._cursor_read_generations: dict[str, int] = {}
+        self._cursor_last_positions: dict[str, tuple[int, int]] = {}
         self._subscriptions: list[int] = []
         self._captures: dict[str, GstSubprocessCapture] = {}
-        self._metadata_captures: dict[str, GstCursorMetadataCapture] = {}
         self._clipboard_enabled = False
         self._clipboard_text = ""
         self._clipboard_subscription: int | None = None
@@ -430,28 +432,59 @@ class GnomeMutterBackend:
         node = self._metadata_nodes.get(surface_id, 0)
         if not node:
             raise CaptureTimeout(f"no cursor metadata node is available for {surface_id}")
-        capture = self._metadata_captures.get(surface_id)
-        if capture is None or capture.node_id != node:
+        with self._lock:
+            move_generation = self._cursor_move_generation
+            last_read_generation = self._cursor_read_generations.get(surface_id, move_generation)
+            previous_position = self._cursor_last_positions.get(surface_id)
+        deadline = time.monotonic() + max(0.1, timeout)
+        last_timeout: CaptureTimeout | None = None
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
             capture = GstCursorMetadataCapture(node, surface_id)
-            self._metadata_captures[surface_id] = capture
-        for _ in range(3):
-            _frame, position = capture.grab(timeout=timeout)
-            if position is not None:
-                return position
+            try:
+                _frame, position = capture.grab(timeout=remaining)
+            except CaptureTimeout as exc:
+                last_timeout = exc
+                continue
+            finally:
+                capture.close()
+            if position is None:
+                continue
+
+            # A move between two reads invalidates an identical coordinate:
+            # it is the signature of a cached pre-move buffer. Keep creating
+            # one-shot readers until a new coordinate is observed or the
+            # caller's timeout expires.
+            if move_generation > last_read_generation and previous_position == position:
+                continue
+
+            with self._lock:
+                self._cursor_last_positions[surface_id] = position
+                self._cursor_read_generations[surface_id] = move_generation
+            return position
+        if last_timeout is not None:
+            raise last_timeout
         return None
 
     def move(self, surface_id: str, x: float, y: float) -> None:
         self._surface(surface_id)
         if self._closed:
             raise BackendUnavailable("Mutter session is closed")
-        _call(
-            self._bus,
-            RD,
-            self._rd_path,
-            RD_SESSION,
-            "NotifyPointerMotionAbsolute",
-            _variant(self._GLib, "(sdd)", (self._streams[surface_id], float(x), float(y))),
-        )
+        stream_paths = [self._streams[surface_id]]
+        metadata_stream = self._metadata_streams.get(surface_id)
+        if metadata_stream and metadata_stream not in stream_paths:
+            stream_paths.append(metadata_stream)
+        for stream_path in stream_paths:
+            _call(
+                self._bus,
+                RD,
+                self._rd_path,
+                RD_SESSION,
+                "NotifyPointerMotionAbsolute",
+                _variant(self._GLib, "(sdd)", (stream_path, float(x), float(y))),
+            )
+        with self._lock:
+            self._cursor_move_generation += 1
 
     @staticmethod
     def _button_code(button: int) -> int:
@@ -570,10 +603,6 @@ class GnomeMutterBackend:
             with contextlib.suppress(Exception):
                 self._bus.signal_unsubscribe(subscription)
         self._subscriptions = []
-        for capture in getattr(self, "_metadata_captures", {}).values():
-            with contextlib.suppress(Exception):
-                capture.close()
-        self._metadata_captures = {}
         if hasattr(self, "_rd_path"):
             with contextlib.suppress(Exception):
                 _call(self._bus, RD, self._rd_path, RD_SESSION, "Stop")

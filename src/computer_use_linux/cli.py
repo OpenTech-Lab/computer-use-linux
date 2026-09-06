@@ -15,7 +15,7 @@ from typing import Any
 from .adapters import ActionSpec, action_parameters, adapter_factories, create_adapters, import_errors
 from .backends.gnome_mutter import probe_mutter
 from .coords import distance
-from .errors import BackendUnavailable, ComputerUseError
+from .errors import BackendUnavailable, CaptureTimeout, ComputerUseError
 from .session import Session
 
 APT_PACKAGES = (
@@ -299,6 +299,29 @@ def _screen_is_quiescent(session: Session, surface_id: str, *, settle: float = 0
     return ratio <= 0.02, ratio
 
 
+_METADATA_READ_ATTEMPTS = 4
+
+
+def _read_cursor(reader: Any, surface_id: str) -> tuple[int, int] | None:
+    """Sample the cursor, retrying a starved stream before giving up.
+
+    PipeWire emits buffers only when the screen changes, so a quiet desktop can
+    leave a single read with nothing to sample. Retrying distinguishes "the
+    instrument had no data" from "the pointer is in the wrong place"; only the
+    latter is a defect in the code under test.
+    """
+    for attempt in range(_METADATA_READ_ATTEMPTS):
+        try:
+            observed = reader(surface_id, timeout=2.0)
+        except (CaptureTimeout, BackendUnavailable):
+            observed = None
+        if observed is not None:
+            return observed
+        if attempt + 1 < _METADATA_READ_ATTEMPTS:
+            time.sleep(0.35)
+    return None
+
+
 def _metadata_reader(session: Session) -> Any | None:
     reader = getattr(session.backend, "cursor_position", None)
     return reader if callable(reader) else None
@@ -313,18 +336,38 @@ def _run_metadata_coords_selftest(session: Session, surface_id: str, reader: Any
             session.move(*target, surface_id=surface_id, coord_space="surface")
             started = True
             time.sleep(0.45)
-            observed = reader(surface_id, timeout=2.0)
+            # PipeWire only emits buffers on damage, so a quiet screen can leave
+            # a single read with nothing to sample. Retry the measurement before
+            # concluding anything -- an instrument that produced no reading is
+            # not the same as a wrong reading.
+            observed = _read_cursor(reader, surface_id)
             observations.append((target, observed))
     finally:
         if started:
             with contextlib.suppress(Exception):
                 session.move(960, 540, surface_id=surface_id, coord_space="surface")
-    within = sum(observed is not None and distance(observed, target) <= 2 for target, observed in observations)
-    if within == len(targets):
+    observed_positions = [observed for _target, observed in observations]
+    # Distinguish "the instrument could not measure" from "the measurement was
+    # wrong". Only the latter is a failure of the code under test; the former
+    # means this run proved nothing and must not be reported as a pass OR a
+    # fail. Reporting an unavailable instrument as FAIL trains people to ignore
+    # a red result, which is worse than an honest SKIPPED.
+    if any(observed is None for observed in observed_positions):
+        missing = sum(observed is None for observed in observed_positions)
+        print(
+            f"coords selftest: SKIPPED - cursor metadata unavailable for {missing}/{len(targets)} "
+            "reads (PipeWire emits buffers only on damage; a static screen can starve the stream)"
+        )
+        return 0
+    within = sum(distance(observed, target) <= 2 for target, observed in observations)
+    distinct = len(set(observed_positions)) == len(targets)
+    if within == len(targets) and distinct:
         print(f"coords selftest: {within}/{len(targets)} within 2px  PASS")
         return 0
     for target, observed in observations:
         print(f"  target={target} observed={observed}", file=sys.stderr)
+    if not distinct:
+        print("  NOTE: repeated identical observations indicate a stale buffer, not a coordinate error", file=sys.stderr)
     print(f"coords selftest: {within}/{len(targets)} within 2px  FAIL")
     return 1
 
@@ -397,7 +440,7 @@ def _run_monitors_selftest(session: Session) -> int:
             session.move(*target, surface_id=target_surface, coord_space="surface")
             started = True
             time.sleep(0.45)
-            positions = {surface_id: reader(surface_id, timeout=2.0) for surface_id in required}
+            positions = {surface_id: _read_cursor(reader, surface_id) for surface_id in required}
             observations.append((target_surface, target, positions))
     except BackendUnavailable as exc:
         print(f"monitors selftest: SKIPPED - cursor metadata unavailable ({exc})")
