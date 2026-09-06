@@ -21,6 +21,25 @@ def _refresh_caps(value: float) -> str:
     return f"{fraction.numerator}/{fraction.denominator}"
 
 
+def _capture_timeout(explicit: float | None) -> float:
+    """Resolve the capture deadline.
+
+    2s is too tight in practice: PipeWire emits frames only on damage, so a quiet or
+    directly-scanned-out monitor can legitimately take longer than that to produce one.
+    """
+    if explicit is not None:
+        return float(explicit)
+    raw = os.environ.get("CUL_CAPTURE_TIMEOUT")
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return 6.0
+
+
 class GstSubprocessCapture:
     """Pull one PipeWire frame through the installed gst-launch executable.
 
@@ -47,10 +66,11 @@ class GstSubprocessCapture:
         if not self.launcher:
             raise BackendUnavailable("gst-launch-1.0 is missing; install GStreamer and gstreamer1.0-pipewire")
 
-    def grab(self, *, timeout: float = 2.0) -> Frame:
+    def grab(self, *, timeout: float | None = None) -> Frame:
         import numpy as np
         from PIL import Image
 
+        timeout = _capture_timeout(timeout)
         fd, raw_path = tempfile.mkstemp(prefix="cul-frame-", suffix=".png")
         os.close(fd)
         output_path = Path(raw_path)
@@ -94,7 +114,13 @@ class GstSubprocessCapture:
                     check=False,
                 )
             except subprocess.TimeoutExpired as exc:
-                raise CaptureTimeout(f"GStreamer capture timed out after {timeout:.1f}s") from exc
+                raise CaptureTimeout(
+                    f"GStreamer capture timed out after {timeout:.1f}s for {self.surface_id}. "
+                    "PipeWire only emits frames when the screen changes, and a fullscreen "
+                    "application can take direct scanout, which bypasses composition and stops "
+                    "the stream entirely. Try another surface (see `cul surfaces`), leave "
+                    "fullscreen on that monitor, or raise CUL_CAPTURE_TIMEOUT (seconds)."
+                ) from exc
             if completed.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
                 detail = (completed.stderr or completed.stdout or "no pipeline output").strip()[-500:]
                 raise CaptureTimeout(f"GStreamer did not produce a frame: {detail}")

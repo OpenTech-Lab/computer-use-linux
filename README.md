@@ -99,46 +99,91 @@ cul app vscode windows
 See [docs/ADAPTERS.md](docs/ADAPTERS.md) for the precedence rule, action list, isolation, and
 bridge lifecycle.
 
-## Quickstart
+## Setup
 
-The supplied `.venv` must be CPython 3.14 with system site-packages. `make setup` validates
-an existing environment and installs the Python package; it never installs apt packages or
-replaces an existing `.venv`.
+### 1. Install PyGObject from your package manager
+
+This is the only step that differs between distributions, and it cannot be skipped: `gi` is
+compiled against your system's GLib and loads its introspection typelibs, so **it cannot be
+installed from PyPI**.
+
+| Distribution | Command |
+| --- | --- |
+| Debian / Ubuntu | `sudo apt install python3-gi gir1.2-atspi-2.0 gstreamer1.0-pipewire` |
+| Fedora / RHEL | `sudo dnf install python3-gobject gstreamer1-plugins-base` |
+| Arch | `sudo pacman -S python-gobject at-spi2-core gst-plugin-pipewire` |
+| openSUSE | `sudo zypper install python3-gobject gstreamer-plugins-base` |
+
+### 2. Clone and bootstrap
 
 ```bash
-make setup
-.venv/bin/cul doctor
-.venv/bin/cul surfaces
-.venv/bin/cul --isolated surfaces
-.venv/bin/cul shot --surface monitor:DP-2 -o /tmp/desktop.png
-.venv/bin/cul shot --surface virtual:0 -o /tmp/isolated.png
-.venv/bin/cul selftest coords --surface monitor:HDMI-1
-.venv/bin/cul selftest monitors
-.venv/bin/cul app list
-.venv/bin/cul-mcp
+git clone https://github.com/OpenTech-Lab/computer-use-linux.git
+cd computer-use-linux
+./scripts/bootstrap.sh
+./.venv/bin/cul doctor
 ```
 
-The screenshot is a PNG returned directly by MCP. The default 1280-pixel image width is a
-deliberate context-budget limit; use the CLI/native shot or MCP `max_width` when reading small text.
-The coordinate selftest reads PipeWire cursor metadata, so it remains reliable while a game or video
-is animating. If the metadata path is unavailable, the legacy frame-difference fallback only reports
-`SKIPPED` when the screen is busy; it never reports a false pass.
+`bootstrap.sh` locates the system interpreter that can `import gi` and builds `.venv` from it with
+`--system-site-packages`. Any Python 3.11+ works — the version is whatever your distribution ships.
+It never replaces an existing `.venv` and never installs system packages.
+
+**`cul doctor` is the source of truth.** It prints one row per precondition — session type, Mutter
+ScreenCast and RemoteDesktop, monitors, AT-SPI, keyboard layout, `/dev/uinput`, X11, Xvfb — and
+tells you exactly what is usable on that machine. Read every row before connecting an agent.
+
+### 3. Connect an agent
+
+```bash
+claude mcp add computer-use -- "$PWD/.venv/bin/cul-mcp"
+```
+
+Add `--isolated` to the command to give the agent its own pointer instead of sharing your cursor:
+
+```bash
+claude mcp add computer-use -- "$PWD/.venv/bin/cul-mcp" --isolated
+```
+
+### 4. First commands
+
+Surface names are per-machine, so start with `surfaces` and use the ids it prints.
+
+```bash
+.venv/bin/cul surfaces                                   # what can I see?
+.venv/bin/cul shot --surface monitor:<ID> -o /tmp/s.png  # capture a screen
+.venv/bin/cul selftest coords --surface monitor:<ID>     # prove clicks land where asked
+.venv/bin/cul app list                                   # which applications are drivable
+```
+
+### If something goes wrong
+
+**`cannot import PyGObject ('gi')`** — the venv was built from the wrong interpreter. If `python3`
+resolves to mise, pyenv, asdf, conda or Homebrew, it has no `gi` and no amount of `pip install` will
+fix it. Do step 1, then `rm -rf .venv && ./scripts/bootstrap.sh`. Point at a specific interpreter
+with `CUL_PYTHON=/usr/bin/python3.12 ./scripts/bootstrap.sh`.
+
+**Screen capture unavailable** — outside GNOME the `Mutter.*` APIs do not exist and the XDG portal
+path is used instead, which prompts for consent once. `doctor` says which path is active.
+
+**`GStreamer capture timed out`** — PipeWire only emits frames when the screen *changes*, and a
+fullscreen application can take direct scanout, which bypasses composition and stops the stream for
+that monitor entirely. A longer timeout does not help; this is not a slow capture, it is no capture.
+Use a different surface (`cul surfaces`), leave fullscreen on that monitor, or raise
+`CUL_CAPTURE_TIMEOUT` if your display really is just idle.
+
+**`/dev/uinput` not writable** — expected. It is needed only by the portable input backend, not by
+GNOME, X11 XTEST or Xvfb. [docs/INSTALL.md](docs/INSTALL.md) has the udev rule if you want it.
+
+Full details, including the optional packages and the headless backend, are in
+[docs/INSTALL.md](docs/INSTALL.md).
 
 ## Requirements
 
-- Linux with Wayland (GNOME 50+ verified) or X11
-- On GNOME, nothing further — Mutter's RemoteDesktop and ScreenCast APIs need no consent and no setup
-- For a portable uinput backend, write access to `/dev/uinput` via a one-time udev rule. This is
-  not required by X11 XTEST or the Xvfb backend:
-  ```
-  KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
-  ```
-- PipeWire and GStreamer `pipewiresrc` for GNOME screen capture
-- Python 3.14 at `/usr/bin/python3.14`, with `.venv` created using `--system-site-packages`
-- `gir1.2-gst-plugins-base-1.0` is optional here: it enables the in-process appsink path used for
-  cursor metadata when available. Ordinary screenshots still use the verified `gst-launch-1.0`
-  subprocess path because the GstApp/GstVideo typelibs are absent on the target machine. Run
-  `scripts/install-deps.sh` manually if desired.
+- **Linux** with Wayland (GNOME 50+ verified) or X11
+- **Python 3.11+** — specifically the system interpreter that ships PyGObject; `bootstrap.sh` finds it
+- **PipeWire** and GStreamer `pipewiresrc` for GNOME screen capture
+- On GNOME, **nothing further** — Mutter's RemoteDesktop and ScreenCast APIs need no consent and no setup
+- Optional: `xvfb` for the fully isolated headless backend; `gir1.2-gst-plugins-base-1.0` for the
+  in-process appsink path (ordinary screenshots use a `gst-launch-1.0` subprocess without it)
 
 ## Safety
 

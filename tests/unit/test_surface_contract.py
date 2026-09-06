@@ -21,7 +21,7 @@ def test_named_surface_screenshot_rejects_a_frame_with_wrong_dimensions(tmp_path
         def list_surfaces(self) -> list[Surface]:
             return [requested]
 
-        def grab(self, surface_id: str, *, timeout: float) -> Frame:
+        def grab(self, surface_id: str, *, timeout: float | None = None) -> Frame:
             del timeout
             return Frame(surface_id, 1280, 720, np.zeros((720, 1280, 3), dtype=np.uint8), 0.0)
 

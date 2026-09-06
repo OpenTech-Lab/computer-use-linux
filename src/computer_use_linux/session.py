@@ -449,7 +449,7 @@ class Session:
         sensitive = source.sensitive_focused()
         if sensitive is not None:
             raise SafetyRefusal(f"refusing screenshot while sensitive window is focused: {sensitive.title or sensitive.app}")
-        frame = self.backend.grab(surface.id, timeout=2.0)
+        frame = self.backend.grab(surface.id)
         self._assert_frame_matches_surface(frame, surface)
         sensitive = source.sensitive_focused()
         if sensitive is not None:

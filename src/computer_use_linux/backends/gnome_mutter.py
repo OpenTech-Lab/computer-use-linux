@@ -711,7 +711,7 @@ class GnomeMutterBackend:
                     _variant(self._GLib, "(sdd)", (stream_path, float(x), float(y))),
                 )
 
-    def grab(self, surface_id: str, *, timeout: float = 2.0) -> Frame:
+    def grab(self, surface_id: str, *, timeout: float | None = None) -> Frame:
         surface = self._surface(surface_id)
         target = self._backend_for_surface(surface)
         if target is not self:
@@ -743,9 +743,12 @@ class GnomeMutterBackend:
         assert last_timeout is not None
         raise last_timeout
 
-    def cursor_position(self, surface_id: str, *, timeout: float = 2.0) -> tuple[int, int] | None:
+    def cursor_position(self, surface_id: str, *, timeout: float | None = None) -> tuple[int, int] | None:
         """Return the exact monitor-local cursor position from SPA metadata."""
 
+        from ..pipewire.gst_capture import _capture_timeout
+
+        timeout = _capture_timeout(timeout)
         surface = self._surface(surface_id)
         target = self._backend_for_surface(surface)
         if target is not self:
