@@ -8,7 +8,7 @@ of a Linux machine. The goal is not a browser-only sandbox: it is the whole desk
 agent can operate a browser, **Godot**, **Blender**, **VSCode**, a terminal, or any other
 GUI application the way a person would.
 
-Current release: **v0.1.0** · [Release notes](docs/version/0.1.0.md)
+Current release: **v0.1.1** · [Release notes](docs/version/0.1.1.md)
 
 > **Status: Phases 0–6 plus virtual-pointer, X11, and Xvfb backend work are implemented.** The
 > project includes the GNOME vertical slice, browser CDP, Godot, Blender, VSCode, and generic

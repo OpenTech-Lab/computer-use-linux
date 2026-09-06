@@ -23,5 +23,5 @@ except ImportError as _exc:  # pragma: no cover
         f"e.g. `./scripts/bootstrap.sh` (running {sys.executable})."
     ) from _exc
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
