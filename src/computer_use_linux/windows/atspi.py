@@ -112,11 +112,12 @@ def atspi_probe() -> tuple[bool, int, str | None]:
 class AtspiWindowSource:
     """AT-SPI application/window source.
 
-    On Wayland the client-reported screen origin is deliberately discarded. Width and height are
-    useful; the x/y values returned by AT-SPI are not a reliable global position.
+    On Wayland the client-reported screen origin is deliberately discarded. X11 callers can opt
+    into the same extents with ``include_position=True`` because the X server supplies a real root
+    coordinate space there.
     """
 
-    def __init__(self):
+    def __init__(self, *, include_position: bool = False):
         self._atspi = _load_atspi()
         self._atspi.init()
         self._desktop = self._atspi.get_desktop(0)
@@ -124,6 +125,7 @@ class AtspiWindowSource:
             raise BackendUnavailable("AT-SPI desktop is unavailable")
         self._refs: dict[str, _WindowRef] = {}
         self._lock = threading.RLock()
+        self._include_position = bool(include_position)
 
     def _applications(self) -> list[Any]:
         apps: list[Any] = []
@@ -169,7 +171,7 @@ class AtspiWindowSource:
                         role=role,
                         width=width,
                         height=height,
-                        position=None,
+                        position=rect[:2] if rect is not None and self._include_position else None,
                         active=active,
                         surface_id=None,
                     )

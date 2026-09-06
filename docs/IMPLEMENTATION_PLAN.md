@@ -5,9 +5,14 @@
 **Status of this document:** every environment claim below was verified by executing a probe on the
 target machine on 2026-09-06. Where a claim is *unverified*, it is explicitly labelled OPEN.
 
-**Current implementation status:** Phases 0–2 are the committed base; the adapter scope of
-Phases 3, 4, 5 (adapter-relevant pieces), and 6 is implemented in the working tree. The portable
-X11/portal/headless backends remain outside this run.
+**Current implementation status:** Phases 0–6 are committed at `fce5759`. The current working
+tree also implements the virtual-pointer surface, X11/Xvfb backends, and installation docs; this
+document remains the historical design record for those phases. The XDG portal and portable
+uinput backend are still not implemented.
+
+The original Phase 5 acceptance text below predates the current backend implementation. Use
+`docs/INSTALL.md`, `docs/COORDINATES.md`, and `docs/ARCHITECTURE.md` for the current contracts and
+capability-gated behavior.
 
 ---
 
@@ -660,9 +665,11 @@ The x11 backend under Xvfb gives a real X server with working XTEST and XGetImag
 and capture are genuinely exercised — not mocked. The target for click assertions is a ~40-line GTK3
 test window in `tests/integration/fixtures/click_target.py` that records event coordinates to stdout.
 
-The `headless` backend's `RecordVirtual` mode (verified callable on this box) is the *local* deterministic
-option: a virtual monitor is invisible to the user, so integration tests can run without hijacking the
-real pointer. Prefer it over the real monitor for anything that clicks.
+The GNOME `RecordVirtual` mode (verified callable on this box) is the *local* deterministic pointer
+option: a virtual monitor is invisible to the user, so pointer tests can run without hijacking the
+real pointer. The implemented `headless` backend uses a private Xvfb display for the stronger
+application/window-stack isolation guarantee. Prefer either isolated path over the real monitor for
+anything that clicks.
 
 **Golden rule for this repo:** a test that asserts a *screenshot looks right* is not a test. Assert
 geometry, assert the target app observed the event, assert text round-tripped.

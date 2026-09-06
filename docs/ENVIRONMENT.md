@@ -191,3 +191,38 @@ And `org.gnome.Shell.Introspect.GetWindows` (which would have given real positio
    actions via `Atspi.Action.do_action()`, which needs no coordinates at all — prefer that over clicking.
 4. Window *raising/focusing* also cannot be done via AT-SPI position; use keyboard (Alt+Tab / Super),
    `gtk-launch`/app activation, or per-app CLI.
+
+---
+# ROUND 6 — virtual pointer, X11, and headless isolation
+
+## RecordVirtual findings
+
+`org.gnome.Mutter.ScreenCast.RecordVirtual` is available on this GNOME 50 session. The product
+creates it with an explicit `modes` property (`size`, `refresh-rate`, and `is-preferred`) and a
+bounded retry when the empty virtual stream temporarily stops emitting PipeWire buffers. The
+surface is listed as `virtual:0`, and its RemoteDesktop pointer metadata is independent of the
+physical cursor.
+
+The virtual stream is **not a second desktop**. A controlled experiment attempted to place an
+ordinary X11 window at the apparent virtual-monitor offset with `XMoveWindow`, and the server
+clamped it back into the physical root. A GTK fullscreen-on-monitor request likewise selected a
+physical monitor. `Mutter.DisplayConfig` did not gain a monitor. Therefore `RecordVirtual` is an
+input-and-capture target only; use the headless backend when applications and their window stack
+must be isolated.
+
+Creating physical and virtual capture pipelines in one Mutter session reproduced the observed
+`Unknown stream (0)` failure for a subsequent physical pointer notification. The backend now
+avoids that topology by using separate bound RemoteDesktop/ScreenCast sessions when both surface
+kinds are exposed; it also retains bounded physical stream recreation/retry for an already-invalid
+stream. Isolated mode records only the virtual stream, so it does not enter that mixed-stream case.
+
+## X11 and headless capability findings
+
+The X11 backend is implemented with python-xlib XTEST input, XGetImage capture, and direct
+TranslateCoords window geometry. It requires both XTEST and root XGetImage; XWayland on this host
+exposes XTEST but rejects root XGetImage with `BadMatch`, so the capability probe correctly reports
+it unavailable there rather than pretending that a screenshot backend exists.
+
+The headless backend starts a private Xvfb display and delegates to the X11 backend. Its integration
+test is capability-gated and skips when `Xvfb` is absent. Install it manually with `sudo apt install
+xvfb cage`; no package installation was attempted during this run because `sudo` is unavailable.

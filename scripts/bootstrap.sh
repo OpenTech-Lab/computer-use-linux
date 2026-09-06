@@ -22,6 +22,6 @@ fi
 
 # These are deliberately installed into the existing environment. No apt command belongs here:
 # PyGObject is supplied by the system site-packages and GstApp is optional at runtime.
-UV_CACHE_DIR="$uv_cache_dir" VIRTUAL_ENV="$venv_dir" uv pip install --python "$venv_dir/bin/python" numpy 'mcp>=2.1' pillow pytest pytest-asyncio ruff
+UV_CACHE_DIR="$uv_cache_dir" VIRTUAL_ENV="$venv_dir" uv pip install --python "$venv_dir/bin/python" numpy 'mcp>=2.1' pillow python-xlib pytest pytest-asyncio ruff
 
 "$venv_dir/bin/python" -c 'import gi, numpy, mcp, PIL, sys; print("ready: python {}.{}; gi {}; numpy {}; PIL {}".format(sys.version_info.major, sys.version_info.minor, gi.__version__, numpy.__version__, PIL.__version__))'

@@ -8,11 +8,17 @@ import struct
 import subprocess
 import tempfile
 import time
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 from ..errors import BackendUnavailable, CaptureTimeout
 from ..types import Frame
+
+
+def _refresh_caps(value: float) -> str:
+    fraction = Fraction(float(value)).limit_denominator(1000)
+    return f"{fraction.numerator}/{fraction.denominator}"
 
 
 class GstSubprocessCapture:
@@ -23,9 +29,20 @@ class GstSubprocessCapture:
     that remains available without installing an apt package.
     """
 
-    def __init__(self, node_id: int, surface_id: str):
+    def __init__(
+        self,
+        node_id: int,
+        surface_id: str,
+        *,
+        width: int | None = None,
+        height: int | None = None,
+        refresh: float | None = None,
+    ):
         self.node_id = int(node_id)
         self.surface_id = surface_id
+        self.width = width
+        self.height = height
+        self.refresh = refresh
         self.launcher = shutil.which("gst-launch-1.0")
         if not self.launcher:
             raise BackendUnavailable("gst-launch-1.0 is missing; install GStreamer and gstreamer1.0-pipewire")
@@ -43,16 +60,30 @@ class GstSubprocessCapture:
             "pipewiresrc",
             f"path={self.node_id}",
             "always-copy=true",
-            "num-buffers=8",
-            "!",
-            "videoconvert",
-            "!",
-            "pngenc",
-            "snapshot=true",
-            "!",
-            "filesink",
-            f"location={output_path}",
+            "num-buffers=1" if self.width is not None and self.height is not None and self.refresh is not None else "num-buffers=8",
         ]
+        if self.width is not None and self.height is not None and self.refresh is not None:
+            command.extend(
+                [
+                    "!",
+                    (
+                        "video/x-raw,format=BGRx,"
+                        f"max-framerate={_refresh_caps(self.refresh)},width={int(self.width)},height={int(self.height)}"
+                    ),
+                ]
+            )
+        command.extend(
+            [
+                "!",
+                "videoconvert",
+                "!",
+                "pngenc",
+                "snapshot=true",
+                "!",
+                "filesink",
+                f"location={output_path}",
+            ]
+        )
         try:
             try:
                 completed = subprocess.run(
@@ -99,19 +130,33 @@ class GstCursorMetadataCapture:
     captures continue to use the embedded-cursor subprocess path above.
     """
 
-    def __init__(self, node_id: int, surface_id: str):
+    def __init__(
+        self,
+        node_id: int,
+        surface_id: str,
+        *,
+        width: int | None = None,
+        height: int | None = None,
+        refresh: float | None = None,
+    ):
         self.node_id = int(node_id)
         self.surface_id = surface_id
+        self.width = width
+        self.height = height
+        self.refresh = refresh
         self._Gst, self._GObject = self._load_gstreamer()
         self._pipeline: Any | None = None
         self._sink: Any | None = None
         self._roi_api: Any | None = None
         try:
+            caps = "video/x-raw,format=BGRx"
+            if self.width is not None and self.height is not None and self.refresh is not None:
+                caps += f",max-framerate={_refresh_caps(self.refresh)},width={int(self.width)},height={int(self.height)}"
             self._pipeline = self._Gst.parse_launch(
                 " ! ".join(
                     (
                         f"pipewiresrc path={self.node_id} always-copy=true",
-                        "video/x-raw,format=BGRx",
+                        caps,
                         "appsink name=cul_sink sync=false max-buffers=1 drop=true",
                     )
                 )

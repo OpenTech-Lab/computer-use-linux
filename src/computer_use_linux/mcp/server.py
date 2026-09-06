@@ -12,6 +12,7 @@ from mcp_types import CallToolResult, ImageContent, TextContent
 from ..adapters import create_adapters, mcp_tool_function
 from ..errors import ComputerUseError
 from ..session import Session
+from ..types import Capability
 
 
 def _json_result(value: Any) -> CallToolResult:
@@ -31,15 +32,15 @@ def _adapter_result(value: Any) -> CallToolResult:
     return _json_result(value)
 
 
-def create_server(session: Session | None = None) -> MCPServer:
+def create_server(session: Session | None = None, *, isolated: bool | None = None) -> MCPServer:
     """Create the stdio MCP server over one shared Session."""
 
-    session = session or Session()
+    session = session or Session(isolated=isolated)
     server = MCPServer(
         name="computer-use-linux",
         version="0.1.0",
         description="Safe, local Linux desktop capture and input",
-        instructions="Coordinates are monitor-surface local pixels; screenshot metadata describes image scaling.",
+        instructions="Coordinates are local to the selected capture/input surface; screenshot metadata describes image scaling.",
     )
 
     def guarded(function: Any) -> Any:
@@ -134,11 +135,14 @@ def create_server(session: Session | None = None) -> MCPServer:
 
     @guarded
     def list_windows() -> CallToolResult:
+        positions_available = bool(getattr(session.backend, "capabilities", Capability(0)) & Capability.WINDOW_GEOMETRY)
         return _json_result(
             {
                 "windows": [window.to_dict() for window in session.list_windows()],
-                "position_available": False,
-                "position_reason": "Wayland AT-SPI does not expose reliable global window positions",
+                "position_available": positions_available,
+                "position_reason": None
+                if positions_available
+                else "the selected backend does not expose reliable global window positions",
             }
         )
 
@@ -164,15 +168,15 @@ def create_server(session: Session | None = None) -> MCPServer:
 
     tools = (
         (screenshot, "screenshot", "Capture a PNG frame and return its geometry metadata."),
-        (list_surfaces, "list_surfaces", "List monitor-local capture surfaces."),
-        (select_surface, "select_surface", "Select the default monitor surface."),
+        (list_surfaces, "list_surfaces", "List capture/input surfaces, including virtual surfaces when available."),
+        (select_surface, "select_surface", "Select the default capture/input surface."),
         (move, "move", "Move the pointer in image or native surface pixels."),
-        (click, "click", "Click at a monitor-local coordinate."),
-        (drag, "drag", "Drag between two monitor-local coordinates."),
-        (scroll, "scroll", "Scroll at a monitor-local coordinate."),
+        (click, "click", "Click at a coordinate on the selected surface."),
+        (drag, "drag", "Drag between two coordinates on the selected surface."),
+        (scroll, "scroll", "Scroll at a coordinate on the selected surface."),
         (key, "key", "Press and release keysym-based key chords."),
         (type_text, "type_text", "Type text using the layout-safe keysym path when possible."),
-        (list_windows, "list_windows", "List accessible windows; Wayland positions are null."),
+        (list_windows, "list_windows", "List accessible windows with geometry when the backend can report it."),
         (focus_window, "focus_window", "Focus an accessible window."),
         (window_tree, "window_tree", "Return a bounded AT-SPI semantic tree."),
         (wait_for_change, "wait_for_change", "Wait for a measurable screenshot change."),
@@ -211,8 +215,8 @@ def create_server(session: Session | None = None) -> MCPServer:
     return server
 
 
-async def _selftest_async() -> int:
-    session = Session()
+async def _selftest_async(isolated: bool | None = None) -> int:
+    session = Session(isolated=isolated)
     server = create_server(session)
     try:
         tools = await server.list_tools()
@@ -275,15 +279,17 @@ async def _selftest_async() -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cul-mcp")
     parser.add_argument("--selftest", action="store_true")
+    parser.add_argument("--isolated", action="store_true", help="default the session to an isolated-capable surface")
     args = parser.parse_args(argv)
+    isolated = True if args.isolated else None
     if args.selftest:
         try:
-            return asyncio.run(_selftest_async())
+            return asyncio.run(_selftest_async(isolated=isolated))
         except (ComputerUseError, OSError, ValueError, RuntimeError) as exc:
             print(f"mcp selftest: FAIL: {exc}")
             return 1
 
-    session = Session()
+    session = Session(isolated=isolated)
     server = create_server(session)
     try:
         server.run("stdio")

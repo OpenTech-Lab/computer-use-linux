@@ -8,9 +8,10 @@ of a Linux machine. The goal is not a browser-only sandbox: it is the whole desk
 agent can operate a browser, **Godot**, **Blender**, **VSCode**, a terminal, or any other
 GUI application the way a person would.
 
-> **Status: Phases 0–6 implemented for the adapter scope.** The project includes the GNOME
-> vertical slice, browser CDP, Godot, Blender, VSCode, and generic AT-SPI adapters. Each adapter
-> is exposed through both `cul app ...` and dynamically generated MCP tools.
+> **Status: Phases 0–6 plus virtual-pointer, X11, and Xvfb backend work are implemented.** The
+> project includes the GNOME vertical slice, browser CDP, Godot, Blender, VSCode, and generic
+> AT-SPI adapters. Each adapter is exposed through both `cul app ...` and dynamically generated
+> MCP tools.
 
 ---
 
@@ -42,14 +43,14 @@ Two findings drive that design, both confirmed by probing a live GNOME 50 / Wayl
   layout, naive keycode injection silently types the wrong characters for `@ [ ] : _`. Pointer
   coordinates are **stream-relative**, so the screenshot's pixel space and the click coordinate
   space are the *same space* — which removes an entire class of multi-monitor bugs.
-- **`/dev/uinput` is reserved for the later portable backend.** It is root-only on stock systems;
+- **`/dev/uinput` is reserved for the portable backend.** It is root-only on stock systems;
   if it already works, commonly Steam's `60-steam-input.rules` supplied the `uaccess` rule.
 - **Not all of GNOME's D-Bus surface is closed — check which.** `org.gnome.Shell.Screenshot`
   and `org.gnome.Shell.Introspect` still *introspect* successfully on GNOME 50 but return
   `Access denied` on every call, so anything built on them looks correct until it runs.
   `org.gnome.Mutter.ScreenCast` is a **different** bus name, and it works for the session user
-  with no prompt at all. Capture prefers it on GNOME and falls back to the portable XDG portal
-  elsewhere.
+  with no prompt at all. Capture prefers it on GNOME; the XDG portal remains the planned portable
+  capture fallback and is not yet implemented.
 
 ## Architecture
 
@@ -65,8 +66,10 @@ scripting interface is deterministic.
 
 Backends are pluggable and selected by runtime capability detection:
 
-- `gnome_mutter` — the current primary path: bound Mutter RemoteDesktop + ScreenCast sessions
-- `portal`, `x11`, and `headless` — planned portable backends, outside this adapter-focused run
+- `gnome_mutter` — the primary Wayland path: bound Mutter RemoteDesktop + ScreenCast sessions
+- `x11` — XTEST input and XGetImage capture on an X11/Xvfb root with real window geometry
+- `headless` — a private Xvfb display for full pointer, keyboard, and window-stack isolation
+- `portal` — not yet implemented; use the explicit backends above
 
 ### App adapters
 
@@ -106,8 +109,10 @@ replaces an existing `.venv`.
 make setup
 .venv/bin/cul doctor
 .venv/bin/cul surfaces
+.venv/bin/cul --isolated surfaces
 .venv/bin/cul shot --surface monitor:DP-2 -o /tmp/desktop.png
-.venv/bin/cul selftest coords --surface monitor:DP-2
+.venv/bin/cul shot --surface virtual:0 -o /tmp/isolated.png
+.venv/bin/cul selftest coords --surface monitor:HDMI-1
 .venv/bin/cul selftest monitors
 .venv/bin/cul app list
 .venv/bin/cul-mcp
@@ -123,11 +128,12 @@ is animating. If the metadata path is unavailable, the legacy frame-difference f
 
 - Linux with Wayland (GNOME 50+ verified) or X11
 - On GNOME, nothing further — Mutter's RemoteDesktop and ScreenCast APIs need no consent and no setup
-- For the later portable (non-GNOME / X11) backend, write access to `/dev/uinput` via a one-time udev rule:
+- For a portable uinput backend, write access to `/dev/uinput` via a one-time udev rule. This is
+  not required by X11 XTEST or the Xvfb backend:
   ```
   KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
   ```
-- PipeWire and `xdg-desktop-portal` for screen capture
+- PipeWire and GStreamer `pipewiresrc` for GNOME screen capture
 - Python 3.14 at `/usr/bin/python3.14`, with `.venv` created using `--system-site-packages`
 - `gir1.2-gst-plugins-base-1.0` is optional here: it enables the in-process appsink path used for
   cursor metadata when available. Ordinary screenshots still use the verified `gst-launch-1.0`
@@ -147,22 +153,28 @@ This tool drives a **real** desktop with **real** input devices. It is built wit
 - Opt-in confirmation for destructive actions
 - Screenshot redaction for regions that should never reach a model
 
-### The agent shares your cursor
+### Virtual pointer and full isolation
 
-On a single seat, Wayland and X11 provide **one logical pointer**. When the agent moves the mouse,
-it moves *your* mouse — you cannot comfortably use the machine at the same time. This is a property
-of the display server, not a limitation of this tool.
+On a single physical seat, the normal Wayland and X11 surfaces still provide **one logical pointer**.
+When the agent selects a physical monitor, moving it moves *your* mouse. This is a property of the
+display server, not a limitation of this tool.
 
-Two things reduce it:
+There are three practical choices:
 
 - **Prefer adapters.** `cul app ...` actions drive applications through their own APIs and
   `do_action()`, so they never touch the pointer at all. Most useful work needs no cursor.
-- **A virtual surface gives the agent its own pointer.** `Mutter.ScreenCast.RecordVirtual`, bound to
-  a RemoteDesktop session, yields a surface whose pointer is genuinely independent — verified: the
-  virtual pointer moved to its commanded coordinate while the real cursor stayed put, and no monitor
-  was added to the desktop layout. It is not yet wired into the public API because placing ordinary
-  application windows onto that surface is still an open question; a nested compositor is the
-  fallback for full isolation.
+- **Use `virtual:0` for an independent pointer and capture stream.** `Mutter.ScreenCast.RecordVirtual`
+  is opt-in: `--isolated` starts a virtual-only session, and a CLI request such as
+  `cul shot --surface virtual:0` selects that mode up front. A normal session lists and creates only
+  physical monitor streams. Do not mix physical and virtual surfaces in one Mutter session; start
+  MCP with `--isolated` when the virtual surface is needed. A live probe moved the virtual pointer
+  while the physical cursor stayed put, and no monitor was added to DisplayConfig. The virtual
+  surface starts empty: it is an input-and-capture target, not a second desktop.
+  Ordinary application windows cannot be placed there by normal X11/GTK operations; those operations
+  remain on a physical desktop surface.
+- **Use the headless backend for full isolation.** `CUL_BACKEND=headless` starts a private Xvfb
+  server, so target applications have a separate pointer, keyboard, window stack, and capture root.
+  It is capability-gated and requires the optional `xvfb` package; see [docs/INSTALL.md](docs/INSTALL.md).
 
 Run it on a machine you are willing to let an agent control.
 
@@ -172,9 +184,9 @@ Run it on a machine you are willing to let an agent control.
 - [x] MCP server + CLI surface
 - [x] Minimal AT-SPI window/focus/readback foundation
 - [x] App adapters: browser, VSCode, Godot, Blender, generic AT-SPI
-- [ ] Independent agent pointer via a virtual surface or nested compositor
-- [ ] X11 and nested/headless backends
-- [ ] Packaging and install docs
+- [x] Independent agent pointer via a virtual surface; full isolation via nested/headless backend
+- [x] X11 and nested/headless backends
+- [x] Packaging and install docs
 
 ## License
 

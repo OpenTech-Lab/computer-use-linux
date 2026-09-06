@@ -19,6 +19,7 @@ dependencies = [
     "mcp>=2.1",
     "numpy",
     "Pillow",
+    "python-xlib",
 ]
 
 [project.scripts]

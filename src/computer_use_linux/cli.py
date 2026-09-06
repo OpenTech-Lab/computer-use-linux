@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .adapters import ActionSpec, action_parameters, adapter_factories, create_adapters, import_errors
+from .backends import probe_headless, probe_x11
 from .backends.gnome_mutter import probe_mutter
 from .coords import distance
 from .errors import BackendUnavailable, CaptureTimeout, ComputerUseError
@@ -138,7 +139,7 @@ def doctor() -> int:
     desktop = os.environ.get("XDG_CURRENT_DESKTOP", "GNOME").split(":")[-1] or "GNOME"
     _doctor_row("session", f"{session_type}/{desktop} {_shell_version()}")
 
-    probe = probe_mutter()
+    probe = probe_mutter(probe_virtual=True)
     if "screen_cast_error" in probe:
         _doctor_row("Mutter.ScreenCast", probe["screen_cast_error"], "WARN")
     else:
@@ -158,6 +159,26 @@ def doctor() -> int:
         _doctor_row("monitors", detail)
     else:
         _doctor_row("monitors", probe.get("display_config_error", "none reported"), "WARN")
+
+    if probe.get("virtual_surface_available"):
+        _doctor_row("virtual surface", str(probe.get("virtual_surface", "RecordVirtual available")))
+    else:
+        _doctor_row(
+            "virtual surface",
+            str(probe.get("virtual_surface_error", "RecordVirtual unavailable")),
+            "WARN",
+        )
+
+    x11_probe = probe_x11()
+    if x11_probe.get("available"):
+        _doctor_row("X11/XTEST+XGetImage", f"{x11_probe.get('display')} {x11_probe.get('size', '')}".strip())
+    else:
+        _doctor_row("X11/XTEST+XGetImage", str(x11_probe.get("error", "unavailable")), "WARN")
+    headless_probe = probe_headless()
+    if headless_probe.get("available"):
+        _doctor_row("headless Xvfb", str(headless_probe.get("detail", "available")))
+    else:
+        _doctor_row("headless Xvfb", str(headless_probe.get("error", "unavailable")), "WARN")
 
     try:
         from .windows.atspi import atspi_probe
@@ -195,7 +216,7 @@ def doctor() -> int:
 def _print_surfaces(session: Session) -> None:
     for surface in session.surfaces:
         print(
-            f"{surface.id}  {surface.width}x{surface.height}  "
+            f"{surface.id}  kind={surface.kind}  {surface.width}x{surface.height}  "
             f"origin=+{surface.origin[0]}+{surface.origin[1]} scale={surface.scale:g}  {surface.label}"
         )
 
@@ -379,10 +400,7 @@ def _run_coords_selftest(session: Session, surface_id: str) -> int:
     baseline = None
     reader = _metadata_reader(session)
     if reader is not None:
-        try:
-            return _run_metadata_coords_selftest(session, surface_id, reader)
-        except BackendUnavailable as exc:
-            print(f"coords selftest: cursor metadata unavailable ({exc}); using differential fallback", file=sys.stderr)
+        return _run_metadata_coords_selftest(session, surface_id, reader)
 
     quiescent, ratio = _screen_is_quiescent(session, surface_id)
     if not quiescent:
@@ -442,13 +460,14 @@ def _run_monitors_selftest(session: Session) -> int:
             time.sleep(0.45)
             positions = {surface_id: _read_cursor(reader, surface_id) for surface_id in required}
             observations.append((target_surface, target, positions))
-    except BackendUnavailable as exc:
-        print(f"monitors selftest: SKIPPED - cursor metadata unavailable ({exc})")
-        return 0
     finally:
         if started:
             with contextlib.suppress(Exception):
                 session.move(960, 540, surface_id="monitor:DP-2", coord_space="surface")
+
+    if any(position is None for _target_surface, _target, positions in observations for position in positions.values()):
+        print("monitors selftest: SKIPPED - cursor metadata unavailable for one or more monitors")
+        return 0
 
     passed = True
     for target_surface, target, positions in observations:
@@ -478,10 +497,10 @@ def _run_modifiers_selftest(session: Session) -> int:
     return 1
 
 
-def _with_session(action: Any) -> int:
+def _with_session(action: Any, *, isolated: bool | None = None) -> int:
     session: Session | None = None
     try:
-        session = Session()
+        session = Session(isolated=isolated)
         return int(action(session))
     except ComputerUseError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -583,7 +602,7 @@ def _print_adapter_result(result: Any) -> None:
     print(json.dumps(result, ensure_ascii=False))
 
 
-def _adapter_command(name: str | None, action: str | None, tokens: list[str]) -> int:
+def _adapter_command(name: str | None, action: str | None, tokens: list[str], *, isolated: bool | None = None) -> int:
     factories = adapter_factories()
     if name is None or name in {"list", "--list"}:
         if action or tokens:
@@ -621,7 +640,7 @@ def _adapter_command(name: str | None, action: str | None, tokens: list[str]) ->
         return 1 if isinstance(result, dict) and result.get("ok") is False else 0
 
     if getattr(adapter_factory, "needs_session", False):
-        return _with_session(lambda session: invoke_with(adapter_factory(session=session, config=session.config)))
+        return _with_session(lambda session: invoke_with(adapter_factory(session=session, config=session.config)), isolated=isolated)
     adapter = adapter_factory(config=descriptor.config)
     try:
         return invoke_with(adapter)
@@ -633,6 +652,7 @@ def _adapter_command(name: str | None, action: str | None, tokens: list[str]) ->
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cul", description="Linux desktop automation")
     parser.add_argument("--version", action="version", version="computer-use-linux 0.1.0")
+    parser.add_argument("--isolated", action="store_true", help="use an isolated-capable surface when available")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("doctor")
@@ -643,7 +663,7 @@ def _build_parser() -> argparse.ArgumentParser:
     shot.add_argument("-o", "--output", required=True)
     selftest = sub.add_parser("selftest")
     selftest.add_argument("kind", choices=("coords", "monitors", "modifiers"))
-    selftest.add_argument("--surface", default="monitor:DP-2")
+    selftest.add_argument("--surface")
 
     move = sub.add_parser("move")
     move.add_argument("x", type=float)
@@ -705,15 +725,28 @@ def _build_parser() -> argparse.ArgumentParser:
     app.add_argument("name", nargs="?", help="adapter name, or list")
     app.add_argument("action", nargs="?", help="adapter action")
     app.add_argument("action_args", nargs=argparse.REMAINDER)
+    for command_parser in sub.choices.values():
+        command_parser.add_argument(
+            "--isolated",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="use an isolated-capable surface when available",
+        )
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    requested_surface = getattr(args, "surface", None) or getattr(args, "surface_id", None)
+    isolated = True if args.isolated or str(requested_surface or "").startswith("virtual:") else None
+
+    def run_session(action: Any) -> int:
+        return _with_session(action, isolated=isolated)
+
     if args.command in {"doctor", "check"}:
         return doctor()
     if args.command == "surfaces":
-        return _with_session(lambda session: (_print_surfaces(session), 0)[1])
+        return run_session(lambda session: (_print_surfaces(session), 0)[1])
     if args.command == "shot":
         def shot_action(session: Session) -> int:
             result = session.screenshot(surface_id=args.surface, max_width=0)
@@ -723,32 +756,32 @@ def main(argv: list[str] | None = None) -> int:
             print(f"saved {output} {result.metadata['image_width']}x{result.metadata['image_height']}")
             return 0
 
-        return _with_session(shot_action)
+        return run_session(shot_action)
     if args.command == "selftest":
-        return _with_session(
-            lambda session: _run_coords_selftest(session, args.surface)
+        return run_session(
+            lambda session: _run_coords_selftest(session, args.surface or session.active_surface_id)
             if args.kind == "coords"
             else _run_monitors_selftest(session)
             if args.kind == "monitors"
             else _run_modifiers_selftest(session)
         )
     if args.command == "move":
-        return _with_session(lambda session: (print(json.dumps(session.move(args.x, args.y, surface_id=args.surface, coord_space=args.coord_space))), 0)[1])
+        return run_session(lambda session: (print(json.dumps(session.move(args.x, args.y, surface_id=args.surface, coord_space=args.coord_space))), 0)[1])
     if args.command == "click":
         button = {"left": 1, "middle": 2, "right": 3}[args.button]
-        return _with_session(
+        return run_session(
             lambda session: (print(json.dumps(session.click(args.x, args.y, surface_id=args.surface, coord_space=args.coord_space, button=button, count=args.count, modifiers=args.modifier))), 0)[1]
         )
     if args.command == "drag":
-        return _with_session(
+        return run_session(
             lambda session: (print(json.dumps(session.drag(args.from_x, args.from_y, args.to_x, args.to_y, surface_id=args.surface, coord_space=args.coord_space, steps=args.steps))), 0)[1]
         )
     if args.command == "scroll":
-        return _with_session(
+        return run_session(
             lambda session: (print(json.dumps(session.scroll(args.x, args.y, dx=args.dx, dy=args.dy, surface_id=args.surface, coord_space=args.coord_space))), 0)[1]
         )
     if args.command == "key":
-        return _with_session(lambda session: (print(json.dumps(session.key(args.keys, confirm=args.confirm))), 0)[1])
+        return run_session(lambda session: (print(json.dumps(session.key(args.keys, confirm=args.confirm))), 0)[1])
     if args.command == "type":
         def type_action(session: Session) -> int:
             result = session.type_text(args.text, mode=args.mode, confirm=args.confirm)
@@ -765,11 +798,11 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"type readback: {focused[1]!r} (focused window {focused[0].id})", file=sys.stderr)
             return 0
 
-        return _with_session(type_action)
+        return run_session(type_action)
     if args.command == "hold-key":
         session: Session | None = None
         try:
-            session = Session()
+            session = Session(isolated=isolated)
             session.hold_key(args.key)
             print(f"holding {args.key}; terminate the process to release it", flush=True)
             while True:
@@ -783,7 +816,7 @@ def main(argv: list[str] | None = None) -> int:
             if session is not None:
                 session.close()
     if args.command == "panic":
-        return _with_session(lambda session: (print(json.dumps(session.panic())), 0)[1])
+        return run_session(lambda session: (print(json.dumps(session.panic())), 0)[1])
     if args.command == "windows":
         def windows_action(session: Session) -> int:
             values = [window.to_dict() for window in session.list_windows()]
@@ -797,18 +830,18 @@ def main(argv: list[str] | None = None) -> int:
                     )
             return 0
 
-        return _with_session(windows_action)
+        return run_session(windows_action)
     if args.command == "focus-window":
-        return _with_session(lambda session: (print(f"focus {args.window_id}: {'PASS' if session.focus_window(args.window_id) else 'requested'}"), 0)[1])
+        return run_session(lambda session: (print(f"focus {args.window_id}: {'PASS' if session.focus_window(args.window_id) else 'requested'}"), 0)[1])
     if args.command == "window-tree":
-        return _with_session(lambda session: (print(json.dumps(session.window_tree(args.window_id, args.depth), ensure_ascii=False)), 0)[1])
+        return run_session(lambda session: (print(json.dumps(session.window_tree(args.window_id, args.depth), ensure_ascii=False)), 0)[1])
     if args.command == "wait-for-change":
-        return _with_session(lambda session: (print(json.dumps(session.wait_for_change(surface_id=args.surface, timeout=args.timeout, threshold=args.threshold))), 0)[1])
+        return run_session(lambda session: (print(json.dumps(session.wait_for_change(surface_id=args.surface, timeout=args.timeout, threshold=args.threshold))), 0)[1])
     if args.command == "select-surface":
-        return _with_session(lambda session: (print(json.dumps(session.select_surface(args.surface_id).to_dict())), 0)[1])
+        return run_session(lambda session: (print(json.dumps(session.select_surface(args.surface_id).to_dict())), 0)[1])
     if args.command == "app":
         try:
-            return _adapter_command(args.name, args.action, args.action_args)
+            return _adapter_command(args.name, args.action, args.action_args, isolated=isolated)
         except ComputerUseError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -816,6 +849,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
     raise AssertionError(f"unhandled command: {args.command}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run one CLI command and turn expected failures into a non-zero result."""
+
+    try:
+        return _main(argv)
+    except ComputerUseError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

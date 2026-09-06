@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..errors import BackendUnavailable
+from ..types import Capability
 from ..windows.atspi import AtspiWindowSource, atspi_probe
 from . import ActionSpec, AdapterBase, register
 
@@ -45,7 +46,7 @@ class AtspiGenericAdapter(AdapterBase):
         return [
             ActionSpec(
                 "windows",
-                "List accessible application windows. Wayland positions are always null.",
+                "List accessible application windows, including geometry when the backend supports it.",
             ),
             ActionSpec(
                 "tree",
@@ -91,10 +92,16 @@ class AtspiGenericAdapter(AdapterBase):
     def _invoke(self, action: str, **kwargs: Any) -> Any:
         source = self._window_source()
         if action == "windows":
+            positions_available = bool(
+                self.session is not None
+                and getattr(self.session.backend, "capabilities", Capability(0)) & Capability.WINDOW_GEOMETRY
+            )
             return {
                 "windows": [window.to_dict() for window in source.list_windows()],
-                "position_available": False,
-                "position_reason": "Wayland AT-SPI does not expose reliable global window positions",
+                "position_available": positions_available,
+                "position_reason": None
+                if positions_available
+                else "the selected backend does not expose reliable global window positions",
             }
         if action == "tree":
             return source.tree(str(kwargs["window_id"]), int(kwargs.get("max_depth", 6)))

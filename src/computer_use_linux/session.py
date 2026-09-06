@@ -6,7 +6,7 @@ import io
 import signal
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .backends import detect
@@ -16,7 +16,7 @@ from .errors import BackendUnavailable, SafetyRefusal, SurfaceNotFound
 from .keys import parse_chord, text_to_keysyms
 from .logging import ActionLogger
 from .safety import redact_frame, require_confirmation
-from .types import Frame, Surface, WindowInfo
+from .types import Capability, Frame, Surface, WindowInfo
 
 
 @dataclass(frozen=True)
@@ -34,15 +34,25 @@ class Session:
         backend: Any | None = None,
         config: Config | None = None,
         window_source: Any | None = None,
+        isolated: bool | None = None,
     ):
-        self.config = config or load_config()
+        base_config = config or load_config()
+        self.config = replace(base_config, isolated=isolated) if isolated is not None else base_config
         self.backend = backend or detect(config=self.config)
         self.surfaces: list[Surface] = list(self.backend.list_surfaces())
         if not self.surfaces:
             raise BackendUnavailable("the selected backend reported no surfaces")
         self._surface_by_id = {surface.id: surface for surface in self.surfaces}
-        self.active_surface_id = getattr(self.backend, "primary_surface_id", self.surfaces[0].id)
+        if self.config.isolated:
+            isolated_surface_id = getattr(self.backend, "isolated_surface_id", None)
+            if not isolated_surface_id or isolated_surface_id not in self._surface_by_id:
+                raise BackendUnavailable("isolated mode requested but the selected backend has no isolated surface")
+            self.active_surface_id = isolated_surface_id
+        else:
+            self.active_surface_id = getattr(self.backend, "primary_surface_id", self.surfaces[0].id)
         if self.active_surface_id not in self._surface_by_id:
+            if self.config.isolated:
+                raise BackendUnavailable("isolated mode surface disappeared during session setup")
             self.active_surface_id = self.surfaces[0].id
         self._last_image_scale: dict[str, float] = {surface.id: 1.0 for surface in self.surfaces}
         self._last_image_origin: dict[str, tuple[int, int]] = {surface.id: (0, 0) for surface in self.surfaces}
@@ -105,10 +115,18 @@ class Session:
         try:
             return self._surface_by_id[chosen]
         except KeyError as exc:
+            if chosen.startswith("virtual:") and getattr(self.backend, "name", "") == "gnome_mutter":
+                raise BackendUnavailable(
+                    "virtual surfaces require a virtual-only session; start cul-mcp with --isolated "
+                    "or select virtual:0 up front"
+                ) from exc
             raise SurfaceNotFound(f"unknown surface: {chosen}") from exc
 
     def select_surface(self, surface_id: str) -> Surface:
         surface = self._surface(surface_id)
+        set_active_surface = getattr(self.backend, "set_active_surface", None)
+        if callable(set_active_surface):
+            set_active_surface(surface.id)
         self.active_surface_id = surface.id
         return surface
 
@@ -362,9 +380,14 @@ class Session:
     def _get_window_source(self, *, required: bool) -> Any | None:
         if self._window_source is None:
             try:
-                from .windows.atspi import AtspiWindowSource
+                backend_source = getattr(self.backend, "window_source", None)
+                if backend_source is not None:
+                    self._window_source = backend_source() if callable(backend_source) else backend_source
+                else:
+                    from .windows.atspi import AtspiWindowSource
 
-                self._window_source = AtspiWindowSource()
+                    capabilities = getattr(self.backend, "capabilities", Capability(0))
+                    self._window_source = AtspiWindowSource(include_position=bool(capabilities & Capability.WINDOW_GEOMETRY))
             except Exception:
                 if required:
                     raise SafetyRefusal("AT-SPI is unavailable; refusing a desktop operation that needs window state")
@@ -427,6 +450,7 @@ class Session:
         if sensitive is not None:
             raise SafetyRefusal(f"refusing screenshot while sensitive window is focused: {sensitive.title or sensitive.app}")
         frame = self.backend.grab(surface.id, timeout=2.0)
+        self._assert_frame_matches_surface(frame, surface)
         sensitive = source.sensitive_focused()
         if sensitive is not None:
             raise SafetyRefusal(f"refusing screenshot while sensitive window is focused: {sensitive.title or sensitive.app}")
@@ -438,6 +462,22 @@ class Session:
             redact_window_titles=self.config.redact_window_titles,
             windows=windows,
         )
+
+    @staticmethod
+    def _assert_frame_matches_surface(frame: Frame, surface: Surface) -> None:
+        actual_dimensions = (int(frame.width), int(frame.height))
+        expected_dimensions = (int(surface.width), int(surface.height))
+        if frame.surface_id != surface.id or actual_dimensions != expected_dimensions:
+            raise BackendUnavailable(
+                f"requested {surface.id} at {expected_dimensions[0]}x{expected_dimensions[1]}, but backend returned "
+                f"frame for {frame.surface_id} at {actual_dimensions[0]}x{actual_dimensions[1]}"
+            )
+        shape = getattr(frame.data, "shape", None)
+        if shape is not None and tuple(shape[:2]) != (expected_dimensions[1], expected_dimensions[0]):
+            raise BackendUnavailable(
+                f"backend returned frame data at {int(shape[1])}x{int(shape[0])}; "
+                f"requested {surface.id} at {expected_dimensions[0]}x{expected_dimensions[1]}"
+            )
 
     def screenshot(
         self,

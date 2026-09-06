@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import BackendUnavailable
+from ..types import Capability
 from ..windows.atspi import AtspiWindowSource, atspi_probe
 from . import ActionSpec, AdapterBase, register
 from ._bridge_security import ensure_private_directory, read_json, write_private_json
@@ -295,7 +296,17 @@ class VscodeAdapter(AdapterBase):
             return {"ok": True, "command": command_id, "mechanism": "keyboard-fallback", "chord": chord, "input": result}
         source = self._source()
         if action == "windows":
-            return {"windows": [window.to_dict() for window in self._windows()], "position_available": False}
+            positions_available = bool(
+                self.session is not None
+                and getattr(self.session.backend, "capabilities", Capability(0)) & Capability.WINDOW_GEOMETRY
+            )
+            return {
+                "windows": [window.to_dict() for window in self._windows()],
+                "position_available": positions_available,
+                "position_reason": None
+                if positions_available
+                else "the selected backend does not expose reliable global window positions",
+            }
         if action == "tree":
             return source.tree(str(kwargs["window_id"]), int(kwargs.get("max_depth", 6)))
         if action == "read_text":

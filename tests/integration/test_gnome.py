@@ -22,6 +22,25 @@ def test_gnome_session_is_available() -> None:
 
 @pytest.mark.requires_session
 @pytest.mark.disruptive
+def test_gnome_named_surface_screenshot_matches_surface_dimensions() -> None:
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        pytest.skip("no Wayland session")
+    from computer_use_linux.session import Session
+
+    session = Session()
+    try:
+        target = next((surface for surface in session.surfaces if surface.id == "monitor:DP-2"), None)
+        if target is None:
+            pytest.skip("the screenshot regression test requires monitor:DP-2")
+        result = session.screenshot(surface_id=target.id, max_width=0)
+        assert result.metadata["surface_id"] == target.id
+        assert (result.metadata["image_width"], result.metadata["image_height"]) == (target.width, target.height)
+    finally:
+        session.close()
+
+
+@pytest.mark.requires_session
+@pytest.mark.disruptive
 def test_gnome_multimonitor_pointer_targeting(capsys) -> None:
     if not os.environ.get("WAYLAND_DISPLAY"):
         pytest.skip("no Wayland session")

@@ -2,7 +2,8 @@
 
 The adapters are the primary interaction path for applications that expose a native control
 surface. Pixel input remains available through the core session, but on GNOME/Wayland it is the
-least reliable tier because AT-SPI cannot provide absolute window positions.
+least reliable tier because AT-SPI cannot provide absolute window positions. The X11 backend
+supplies real root-relative window positions when its `WINDOW_GEOMETRY` capability is available.
 
 The order is explicit:
 

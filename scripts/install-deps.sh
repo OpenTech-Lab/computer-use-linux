@@ -4,6 +4,7 @@ set -euo pipefail
 # The app adapters use standard-library sockets plus the already-installed browser/Godot/Blender/
 # VSCode executables. Missing packages below only affect optional desktop backends or capture
 # enhancements; adapter imports remain lazy and do not hard-fail.
+# Minimal full-isolation setup: sudo apt install xvfb cage
 apt_packages=(
     gir1.2-gst-plugins-base-1.0
     gstreamer1.0-pipewire
