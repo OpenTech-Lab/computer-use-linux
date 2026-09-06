@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "computer-use-linux"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Safe, capability-detected desktop automation for Linux"
 readme = "README.md"
 license = "MIT"
@@ -37,6 +37,9 @@ markers = [
     "disruptive: moves or types on the user's desktop",
     "requires_consent: opens a desktop consent dialog",
 ]
+
+[tool.setuptools.dynamic]
+version = {attr = "computer_use_linux.__version__"}
 
 [tool.ruff]
 line-length = 220

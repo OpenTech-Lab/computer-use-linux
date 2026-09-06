@@ -8,6 +8,8 @@ of a Linux machine. The goal is not a browser-only sandbox: it is the whole desk
 agent can operate a browser, **Godot**, **Blender**, **VSCode**, a terminal, or any other
 GUI application the way a person would.
 
+Current release: **v0.1.0** · [Release notes](docs/version/0.1.0.md)
+
 > **Status: Phases 0–6 plus virtual-pointer, X11, and Xvfb backend work are implemented.** The
 > project includes the GNOME vertical slice, browser CDP, Godot, Blender, VSCode, and generic
 > AT-SPI adapters. Each adapter is exposed through both `cul app ...` and dynamically generated
@@ -232,6 +234,25 @@ Run it on a machine you are willing to let an agent control.
 - [x] Independent agent pointer via a virtual surface; full isolation via nested/headless backend
 - [x] X11 and nested/headless backends
 - [x] Packaging and install docs
+
+## Releasing
+
+```bash
+./scripts/bump-version.sh            # auto-increment the patch version
+./scripts/bump-version.sh 0.2.0      # explicit version
+./scripts/bump-version.sh --tag-only # tag the current version, no file changes
+```
+
+Flags: `--force` (allow a non-increasing version), `--no-tag`, `--no-push`.
+
+The version has **one** source of truth, `__version__` in
+`src/computer_use_linux/__init__.py`. `pyproject.toml` declares `dynamic = ["version"]` and reads
+that attribute, and the CLI's `--version` imports it, so a single edit propagates to the package
+metadata and the CLI together. The script refuses to run if that arrangement is broken, and
+`tests/unit/test_version_single_source.py` enforces it.
+
+Each release writes `docs/version/<version>.md` from the commits since the previous tag, commits,
+tags, pushes, and creates a GitHub release when `gh` is available.
 
 ## License
 

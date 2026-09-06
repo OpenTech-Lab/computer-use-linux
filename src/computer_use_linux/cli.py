@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .adapters import ActionSpec, action_parameters, adapter_factories, create_adapters, import_errors
 from .backends import probe_headless, probe_x11
 from .backends.gnome_mutter import probe_mutter
@@ -651,7 +652,7 @@ def _adapter_command(name: str | None, action: str | None, tokens: list[str], *,
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cul", description="Linux desktop automation")
-    parser.add_argument("--version", action="version", version="computer-use-linux 0.1.0")
+    parser.add_argument("--version", action="version", version=f"computer-use-linux {__version__}")
     parser.add_argument("--isolated", action="store_true", help="use an isolated-capable surface when available")
     sub = parser.add_subparsers(dest="command", required=True)
 
