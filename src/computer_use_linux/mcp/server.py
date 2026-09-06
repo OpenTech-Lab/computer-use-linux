@@ -9,12 +9,26 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 from mcp_types import CallToolResult, ImageContent, TextContent
 
+from ..adapters import create_adapters, mcp_tool_function
 from ..errors import ComputerUseError
 from ..session import Session
 
 
 def _json_result(value: Any) -> CallToolResult:
     return CallToolResult(content=[TextContent(type="text", text=json.dumps(value, ensure_ascii=False))])
+
+
+def _adapter_result(value: Any) -> CallToolResult:
+    """Convert adapter values to MCP content, keeping PNGs as real image blocks."""
+
+    if isinstance(value, CallToolResult):
+        return value
+    if isinstance(value, dict) and value.get("png_base64"):
+        encoded = str(value["png_base64"])
+        image = ImageContent(type="image", data=encoded, mime_type=str(value.get("mime_type", "image/png")))
+        metadata = {key: item for key, item in value.items() if key != "png_base64"}
+        return CallToolResult(content=[image, TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False))])
+    return _json_result(value)
 
 
 def create_server(session: Session | None = None) -> MCPServer:
@@ -166,8 +180,34 @@ def create_server(session: Session | None = None) -> MCPServer:
     )
     for function, name, description in tools:
         server.add_tool(function, name=name, description=description, structured_output=False)
+    adapters = create_adapters(session=session, config=session.config)
+    for adapter_name, adapter in adapters.items():
+        for spec in adapter.actions():
+            exposed_actions = (spec.name, *spec.aliases)
+            for exposed_action in exposed_actions:
+                function = mcp_tool_function(adapter, spec, action_name=exposed_action)
+                original = function
+
+                @wraps(original)
+                def guarded_adapter_tool(*args: Any, _original: Any = original, **kwargs: Any) -> CallToolResult:
+                    del args
+                    try:
+                        return _adapter_result(_original(**kwargs))
+                    except Exception:
+                        session.release_all()
+                        raise
+
+                guarded_adapter_tool.__name__ = f"app_{adapter_name}_{exposed_action.replace('-', '_')}"
+                guarded_adapter_tool.__signature__ = original.__signature__
+                server.add_tool(
+                    guarded_adapter_tool,
+                    name=guarded_adapter_tool.__name__,
+                    description=spec.description,
+                    structured_output=False,
+                )
     # Keep the owner alive for the whole MCP transport lifetime and make it available to tests.
     server._cul_session = session  # type: ignore[attr-defined]
+    server._cul_adapters = adapters  # type: ignore[attr-defined]
     return server
 
 
@@ -192,6 +232,13 @@ async def _selftest_async() -> int:
             "window_tree",
             "wait_for_change",
             "panic",
+            "app_browser_launch",
+            "app_browser_navigate",
+            "app_godot_eval_gdscript",
+            "app_godot_eval",
+            "app_blender_run_python",
+            "app_vscode_command",
+            "app_atspi_generic_windows",
         ]
         missing = [name for name in required if name not in names]
         if missing:

@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .adapters import ActionSpec, action_parameters, adapter_factories, create_adapters, import_errors
 from .backends.gnome_mutter import probe_mutter
 from .coords import distance
 from .errors import BackendUnavailable, ComputerUseError
@@ -450,6 +451,142 @@ def _with_session(action: Any) -> int:
             session.close()
 
 
+def _coerce_adapter_value(value: str, schema: dict[str, Any] | Any) -> Any:
+    kind = schema.get("type", "string") if isinstance(schema, dict) else "string"
+    if kind == "boolean":
+        return value.strip().casefold() in {"1", "true", "yes", "on"}
+    if kind == "integer":
+        return int(value)
+    if kind == "number":
+        return float(value)
+    if kind in {"array", "object"}:
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            if kind == "array":
+                return [part for part in value.split(",") if part]
+            raise ValueError(f"expected JSON for adapter {kind} parameter")
+    return value
+
+
+def _parse_adapter_args(tokens: list[str], spec: ActionSpec, *, force_confirmation: bool = False) -> dict[str, Any]:
+    """Parse action flags using the ActionSpec, keeping the CLI independent of adapters."""
+
+    parameters = action_parameters(spec, force_confirmation=force_confirmation)
+    values: dict[str, Any] = {}
+    positional: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            positional.extend(tokens[index + 1 :])
+            break
+        if not token.startswith("--"):
+            positional.append(token)
+            index += 1
+            continue
+        key_value = token[2:]
+        if "=" in key_value:
+            key, raw = key_value.split("=", 1)
+        else:
+            key = key_value
+            if index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
+                index += 1
+                raw = tokens[index]
+            else:
+                raw = "true"
+        normalized = key.replace("-", "_")
+        if normalized not in parameters:
+            raise ValueError(f"unknown adapter parameter --{key}")
+        schema = parameters[normalized]
+        values[normalized] = _coerce_adapter_value(raw, schema)
+        index += 1
+
+    required = [name for name, value in parameters.items() if bool(value.get("required", False)) or "default" not in value]
+    for name in required:
+        if name not in values and positional:
+            values[name] = _coerce_adapter_value(positional.pop(0), parameters[name])
+    if positional:
+        raise ValueError(f"unexpected positional adapter arguments: {' '.join(positional)}")
+    for name, value in parameters.items():
+        if name not in values and "default" in value:
+            values[name] = value["default"]
+    return values
+
+
+def _adapter_specs_json(adapter: Any) -> list[dict[str, Any]]:
+    force_confirmation = getattr(adapter.config, "confirm_mode", "destructive") == "all"
+    return [
+        {
+            "name": spec.name,
+            "aliases": list(spec.aliases),
+            "description": spec.description,
+            "parameters": {name: dict(value) for name, value in action_parameters(spec, force_confirmation=force_confirmation).items()},
+            "confirmation": spec.dangerous or force_confirmation,
+        }
+        for spec in adapter.actions()
+    ]
+
+
+def _print_adapter_result(result: Any) -> None:
+    if isinstance(result, dict) and result.get("png_base64"):
+        summary = {key: value for key, value in result.items() if key != "png_base64"}
+        summary["image"] = "PNG returned as an image block by MCP; pass --output to save from CLI"
+        print(json.dumps(summary, ensure_ascii=False))
+        return
+    if isinstance(result, str):
+        print(result)
+        return
+    print(json.dumps(result, ensure_ascii=False))
+
+
+def _adapter_command(name: str | None, action: str | None, tokens: list[str]) -> int:
+    factories = adapter_factories()
+    if name is None or name in {"list", "--list"}:
+        if action or tokens:
+            raise ValueError("`cul app list` does not accept an action")
+        adapters = create_adapters()
+        for adapter_name, adapter in adapters.items():
+            try:
+                detected = adapter.detect()
+                status = "detected" if detected else "not-running"
+            except Exception as exc:
+                status = f"unavailable ({type(exc).__name__}: {exc})"
+            actions = ", ".join(spec.name for spec in adapter.actions())
+            print(f"{adapter_name}\t{status}\tactions: {actions}")
+        errors = import_errors()
+        for module, error in errors.items():
+            print(f"{module}\tunavailable\t{error}", file=sys.stderr)
+        return 0
+    normalized_name = name.replace("-", "_")
+    if normalized_name not in factories:
+        raise BackendUnavailable(f"unknown adapter {name!r}; available adapters: {', '.join(factories)}")
+    adapter_factory = factories[normalized_name]
+    descriptor = adapter_factory(config=None)
+    if action is None or action in {"describe", "help"}:
+        _print_adapter_result(_adapter_specs_json(descriptor))
+        return 0
+    if action == "detect":
+        _print_adapter_result({"adapter": normalized_name, "detected": descriptor.detect()})
+        return 0
+    spec = descriptor.action_spec(action)
+    values = _parse_adapter_args(tokens, spec, force_confirmation=descriptor.config.confirm_mode == "all")
+
+    def invoke_with(adapter: Any) -> int:
+        result = adapter.invoke(action, **values)
+        _print_adapter_result(result)
+        return 1 if isinstance(result, dict) and result.get("ok") is False else 0
+
+    if getattr(adapter_factory, "needs_session", False):
+        return _with_session(lambda session: invoke_with(adapter_factory(session=session, config=session.config)))
+    adapter = adapter_factory(config=descriptor.config)
+    try:
+        return invoke_with(adapter)
+    finally:
+        with contextlib.suppress(Exception):
+            adapter.close()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cul", description="Linux desktop automation")
     parser.add_argument("--version", action="version", version="computer-use-linux 0.1.0")
@@ -521,6 +658,10 @@ def _build_parser() -> argparse.ArgumentParser:
     wait.add_argument("--threshold", type=float, default=0.002)
     select = sub.add_parser("select-surface")
     select.add_argument("surface_id")
+    app = sub.add_parser("app", help="list and invoke native application adapters")
+    app.add_argument("name", nargs="?", help="adapter name, or list")
+    app.add_argument("action", nargs="?", help="adapter action")
+    app.add_argument("action_args", nargs=argparse.REMAINDER)
     return parser
 
 
@@ -622,6 +763,15 @@ def main(argv: list[str] | None = None) -> int:
         return _with_session(lambda session: (print(json.dumps(session.wait_for_change(surface_id=args.surface, timeout=args.timeout, threshold=args.threshold))), 0)[1])
     if args.command == "select-surface":
         return _with_session(lambda session: (print(json.dumps(session.select_surface(args.surface_id).to_dict())), 0)[1])
+    if args.command == "app":
+        try:
+            return _adapter_command(args.name, args.action, args.action_args)
+        except ComputerUseError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except (OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
     raise AssertionError(f"unhandled command: {args.command}")
 
 

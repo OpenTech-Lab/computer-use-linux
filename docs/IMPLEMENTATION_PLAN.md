@@ -5,6 +5,10 @@
 **Status of this document:** every environment claim below was verified by executing a probe on the
 target machine on 2026-09-06. Where a claim is *unverified*, it is explicitly labelled OPEN.
 
+**Current implementation status:** Phases 0–2 are the committed base; the adapter scope of
+Phases 3, 4, 5 (adapter-relevant pieces), and 6 is implemented in the working tree. The portable
+X11/portal/headless backends remain outside this run.
+
 ---
 
 ## 0. Read this first: corrections to the prior recon
@@ -617,8 +621,8 @@ Portal backend acceptance is the **only** step needing a human (one consent dial
 **Acceptance**
 ```bash
 .venv/bin/cul app blender launch --blender /opt/blender/blender
-.venv/bin/cul app blender run-python --expr "import bpy; print(len(bpy.data.objects))"   # -> 3
-.venv/bin/cul app godot eval --expr 'print(Engine.get_version_info().string)'            # -> 4.6.2.stable
+.venv/bin/cul app blender run-python --expr "import bpy; print(len(bpy.data.objects))" --confirm   # -> 3
+.venv/bin/cul app godot eval --expr 'print(Engine.get_version_info().string)' --confirm      # -> 4.6.2.stable
 .venv/bin/cul app vscode command --id workbench.action.showCommands
 ```
 

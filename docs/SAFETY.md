@@ -16,9 +16,10 @@ This project controls the user's real desktop.
   are blacked out in the numpy frame before PNG encoding. A title redaction without reliable
   Wayland bounds fails closed rather than returning an unredacted frame.
 * The default `destructive` confirmation policy gates Super, Alt+F4, Ctrl+Alt chords, Delete,
-  and configured sensitive-window text entry. Use explicit `confirm=true` only when the action is
-  intended.
+  configured sensitive-window text entry, and all adapter code-evaluation actions. Blender
+  `run_python`, Godot `eval_gdscript`/`eval`, and browser `eval` are refused before a subprocess or
+  socket bridge is reached unless `confirm=true` is supplied. Use explicit confirmation only when
+  the action is intended.
 
 The implementation never calls `org.gnome.Shell.Screenshot`, `org.gnome.Shell.Introspect`, or
 `org.gnome.Shell.Eval`, and never uses `RecordWindow` before the Phase 7 shell extension.
-

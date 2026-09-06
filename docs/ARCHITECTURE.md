@@ -1,18 +1,25 @@
 # Architecture
 
-Phases 0–2 use one long-lived `Session`. The session owns a capability-detected backend,
-monitor-local surfaces, coordinate/image-scale state, the held-input set, the safety watchdog,
-and the optional AT-SPI window source.
+The current implementation uses one long-lived `Session` for desktop operations and passes that
+session to adapters that need semantic focus or AT-SPI. The session owns a capability-detected
+backend, monitor-local surfaces, coordinate/image-scale state, the held-input set, the safety
+watchdog, and the optional AT-SPI window source. Native app adapters are the preferred path for
+application-specific work.
 
 ```text
-CLI / stdio MCP
-       |
-    Session
-       |
+CLI / stdio MCP ──> Session ──> desktop backend
+       │                 │
+       └───────────────> adapter registry
+                         ├─ browser: CDP
+                         ├─ godot: headless GDScript / editor socket
+                         ├─ blender: --python-expr / bpy socket
+                         ├─ vscode: code CLI / AT-SPI / Unix socket
+                         └─ atspi_generic: Action.do_action()
+
 GnomeMutterBackend
-   |             |
+   │             │
 RemoteDesktop  ScreenCast
-   |             |
+   │             │
 keysym input   PipeWire node -> gst-launch-1.0 -> PNG -> numpy
 ```
 
@@ -30,7 +37,7 @@ it invokes `gst-launch-1.0 -q pipewiresrc ... ! videoconvert ! pngenc ! filesink
 result with Pillow. This is intentionally a per-frame subprocess until the missing typelib can be
 installed by a human.
 
-The Phase 1 AT-SPI source supplies window identity, title, role, state, size, focus activation,
-and text readback. It always returns `position: null` on this Wayland session; no position is
-fabricated from AT-SPI's `(0, 0)` extents.
-
+The AT-SPI source supplies window identity, title, role, state, size, focus activation, text
+readback, and semantic actions. It returns `position: null` on this Wayland session; no position
+is fabricated from AT-SPI's `(0, 0)` extents. The adapter order is native API, AT-SPI action, then
+screenshot-derived pixel coordinates.

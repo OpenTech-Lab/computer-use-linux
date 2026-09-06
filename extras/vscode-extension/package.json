@@ -1,0 +1,17 @@
+{
+  "name": "computer-use-linux-bridge",
+  "displayName": "computer-use-linux Bridge",
+  "description": "Loopback VSCode command bridge for computer-use-linux",
+  "version": "0.1.0",
+  "publisher": "computer-use-linux",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "categories": [
+    "Other"
+  ]
+}

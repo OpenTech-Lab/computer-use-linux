@@ -8,9 +8,9 @@ of a Linux machine. The goal is not a browser-only sandbox: it is the whole desk
 agent can operate a browser, **Godot**, **Blender**, **VSCode**, a terminal, or any other
 GUI application the way a person would.
 
-> **Status: Phases 0–2 implemented.** The current vertical slice is GNOME 50 capture,
-> keysym-based input, AT-SPI editor readback, and a stdio MCP server. Later backends and
-> app adapters are intentionally not part of this run.
+> **Status: Phases 0–6 implemented for the adapter scope.** The project includes the GNOME
+> vertical slice, browser CDP, Godot, Blender, VSCode, and generic AT-SPI adapters. Each adapter
+> is exposed through both `cul app ...` and dynamically generated MCP tools.
 
 ---
 
@@ -66,7 +66,7 @@ scripting interface is deterministic.
 Backends are pluggable and selected by runtime capability detection:
 
 - `gnome_mutter` — the current primary path: bound Mutter RemoteDesktop + ScreenCast sessions
-- `portal`, `x11`, and `headless` — planned portable backends, not selected in Phases 0–2
+- `portal`, `x11`, and `headless` — planned portable backends, outside this adapter-focused run
 
 ### App adapters
 
@@ -79,6 +79,8 @@ Backends are pluggable and selected by runtime capability detection:
 | GTK / Qt apps | AT-SPI2 semantic tree |
 
 New applications are added by implementing the adapter interface, without touching core.
+See [docs/ADAPTERS.md](docs/ADAPTERS.md) for the precedence rule, action list, isolation, and
+bridge lifecycle.
 
 ## Quickstart
 
@@ -93,6 +95,7 @@ make setup
 .venv/bin/cul shot --surface monitor:DP-2 -o /tmp/desktop.png
 .venv/bin/cul selftest coords --surface monitor:DP-2
 .venv/bin/cul selftest monitors
+.venv/bin/cul app list
 .venv/bin/cul-mcp
 ```
 
@@ -137,7 +140,7 @@ Run it on a machine you are willing to let an agent control.
 - [x] Core input injection (Mutter RemoteDesktop) and screen capture (Mutter ScreenCast)
 - [x] MCP server + CLI surface
 - [x] Minimal AT-SPI window/focus/readback foundation
-- [ ] App adapters: browser, VSCode, Godot, Blender
+- [x] App adapters: browser, VSCode, Godot, Blender, generic AT-SPI
 - [ ] X11 and nested/headless backends
 - [ ] Packaging and install docs
 

@@ -15,11 +15,13 @@
 | `org.gnome.Shell.Screenshot.Screenshot` | **Access denied** (introspects, but call refused) |
 | `org.gnome.Shell.Introspect.GetWindows` | **Access denied** |
 
-=> Input needs **no root, no daemon, no consent**. GNOME's private D-Bus APIs are closed on 50.x; do not build on them.
+=> Input needs **no root, no daemon, no consent**. On this host the GNOME Mutter RemoteDesktop
+and ScreenCast session APIs are reachable without a dialog; the implementation probes them at
+runtime because they are private compositor APIs.
 
 ## Installed / missing
-- Present: `google-chrome`, `firefox`, `code` 1.134.0, `godot` 4.6.2.stable, `ffmpeg`, ImageMagick `import`, `xrandr`, `busctl`, `snap`
-- **Missing**: `blender` (apt candidate 5.0.1+dfsg-1ubuntu1), xdotool, wmctrl, ydotool, grim, slurp, scrot, maim, wl-clipboard, xclip, Xvfb, Xephyr, weston, labwc, sway, cage, mutter(standalone), x11vnc, wayvnc, flatpak
+- Present: `google-chrome` 151.0.7922.173, `firefox`, `code` 1.134.0, `godot` 4.6.2.stable, `/opt/blender/blender` 5.1.2, `ffmpeg`, ImageMagick `import`, `xrandr`, `busctl`, `snap`
+- **Missing/optional**: xdotool, wmctrl, ydotool, grim, slurp, scrot, maim, wl-clipboard, xclip, Xvfb, Xephyr, weston, labwc, sway, cage, mutter(standalone), x11vnc, wayvnc, flatpak
 - Python: **default `python3` is mise 3.11.15** (has PIL+numpy; NO gi/dbus). System `/usr/bin/python3` is **3.14.4** and HAS `gi` + `dbus`.
   - Consequence: a venv built on mise python cannot `import gi`. Either use `/usr/bin/python3` for the portal/D-Bus layer, or talk D-Bus over the raw socket without PyGObject.
 - `node` 26.1.0, `npm`, `uv` available.
@@ -27,19 +29,19 @@
 ## Capability matrix (what a computer-use tool can actually do here)
 | Need | Path | Consent |
 |---|---|---|
-| Keyboard/mouse injection | **uinput virtual devices** (ABS pointer + keyboard + wheel) | none |
-| Input (fallback) | RemoteDesktop portal + libei | one-time |
-| Screen capture | **ScreenCast portal + PipeWire**, `persist_mode=2` + saved `restore_token` | one-time, then persistent |
+| Keyboard/mouse injection | **Mutter RemoteDesktop** keysym/pointer API | none |
+| Input (portable fallback) | uinput virtual devices or a supported portal backend | none / one-time |
+| Screen capture | **Mutter ScreenCast + PipeWire** on GNOME; portal fallback elsewhere | none / one-time |
 | Screen capture (fallback) | Screenshot portal | dialog per call — unsuitable for automation |
 | Window list/geometry | GNOME Introspect DENIED → AT-SPI, or ship our own GNOME Shell extension | none |
-| Semantic UI tree | AT-SPI2 (needs toolkit-accessibility=true; Chrome needs `--force-renderer-accessibility`) | none |
+| Semantic UI tree | AT-SPI2 works with `toolkit-accessibility=false`; managed Chromium uses `--force-renderer-accessibility` | none |
 | Deterministic / CI | nested compositor (cage/labwc/sway) or Xvfb — must be installed | none |
 
 ## App-control notes (prefer real APIs over pixel-poking)
 - **Browser**: Chrome DevTools Protocol via `--remote-debugging-port` is far more reliable than clicking pixels.
-- **VSCode**: `code` CLI, plus Electron exposes a good AT-SPI tree; a companion extension gives full control.
-- **Godot 4.6**: `--headless`, `--script`, and an EditorPlugin can expose a control socket.
-- **Blender 5.0**: `--python` / `--python-expr`; the standard pattern is a small addon holding a socket (this machine's operator already uses a Blender-MCP addon of that shape).
+- **VSCode**: `code` CLI, plus Electron exposes a good AT-SPI tree; the project includes an optional companion extension for full command control.
+- **Godot 4.6**: `--headless`, `--script`, and the included EditorPlugin expose a control socket.
+- **Blender 5.1**: `/opt/blender/blender` (not on `PATH`) supports `--python` / `--python-expr`; the project includes a small main-thread socket addon.
 
 ---
 # ROUND 2 — additional verified findings
@@ -79,12 +81,12 @@ CreateSession -> /org/freedesktop/portal/desktop/request/1_228/cu_...
 | Chrome | `--headless=new --remote-debugging-port=9333`, then `GET /json/version` | **WORKS** — Chrome/151.0.7922.173, CDP protocol 1.3, websocket URL returned |
 | Godot | `godot --headless --script probe.gd` (SceneTree `_init`) | **WORKS** — 4.6.2-stable, `DisplayServer.get_name()=headless`, clean exit 0 |
 | VSCode | `code --version` | present, 1.134.0 |
-| Blender | — | **NOT INSTALLED**, needs `sudo apt install blender` (5.0.1) → manual user step |
+| Blender | `/opt/blender/blender --version` | **WORKS** — Blender 5.1.2 is installed, but the absolute path must be used or configured |
 
 Godot probe reference: `godot-probe/probe.gd` in this scratchpad.
 
 ---
-# ROUND 3 — CORRECTION to Round 1 (important)
+# ROUND 3 — CORRECTION to Round 1 (historical; current implementation follows the revised matrix)
 
 Round 1 said capture "must" go through the XDG portal with a consent dialog. **That was too strong.**
 
@@ -111,13 +113,14 @@ colors sampled → genuine desktop content, not a blank buffer).
 
 | Input path | Consent | Portability |
 |---|---|---|
-| **uinput via ctypes** | none | Wayland + X11, compositor-independent — **preferred** |
+| **Mutter RemoteDesktop** | none | GNOME only — **preferred on this verified host because it is keysym- and stream-relative** |
 | `org.gnome.Mutter.RemoteDesktop` | none | GNOME only |
 | RemoteDesktop portal + libei | one-time | cross-desktop |
 
 **Design implication:** do NOT hard-code one path. Implement capture as a strategy with runtime
 probing, preferring Mutter ScreenCast on GNOME for zero friction and falling back to the XDG
-portal for portability/other desktops. Keep uinput as the input path since it is the most portable.
+portal for portability/other desktops. Keep uinput as the portable input path, while preferring
+Mutter RemoteDesktop on this host for keysym correctness and stream-relative coordinates.
 
 ---
 # ROUND 4 — FULL END-TO-END VALIDATION (the foundation is proven)

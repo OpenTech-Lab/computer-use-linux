@@ -55,6 +55,35 @@ def _text(accessible: Any, atspi: Any, limit: int = 4000) -> str:
         return ""
 
 
+def _actions(accessible: Any, limit: int = 32) -> list[dict[str, Any]]:
+    """Return the semantic actions exposed by one accessible object.
+
+    AT-SPI action indices are local to the object.  Keeping the index in the result lets callers
+    invoke the action without ever translating it into a screen coordinate.
+    """
+
+    try:
+        action = accessible.get_action()
+        if action is None:
+            return []
+        count = min(int(action.get_n_actions()), limit)
+        result: list[dict[str, Any]] = []
+        for index in range(count):
+            get_name = getattr(action, "get_action_name", None) or getattr(action, "get_name")
+            get_description = getattr(action, "get_action_description", None) or getattr(action, "get_description")
+            result.append(
+                {
+                    "index": index,
+                    "name": str(get_name(index) or ""),
+                    "description": str(get_description(index) or ""),
+                    "keybinding": str(action.get_key_binding(index) or ""),
+                }
+            )
+        return result
+    except Exception:
+        return []
+
+
 def _slug(value: str) -> str:
     return re.sub(r"[^a-z0-9_.-]+", "-", value.casefold()).strip("-") or "app"
 
@@ -304,6 +333,95 @@ class AtspiWindowSource:
             value = value.removeprefix("Text Editor\n")
         return value
 
+    def actions(self, window_id: str, max_depth: int = 6) -> list[dict[str, Any]]:
+        """List AT-SPI actions with a child path for deterministic invocation."""
+
+        ref = self._ref(window_id)
+        result: list[dict[str, Any]] = []
+
+        def visit(node: Any, path: tuple[int, ...], depth: int) -> None:
+            for action in _actions(node):
+                action.update(
+                    {
+                        "path": list(path),
+                        "role": str(node.get_role_name() or ""),
+                        "node_name": str(node.get_name() or ""),
+                        "text": _text(node, self._atspi, limit=300),
+                    }
+                )
+                result.append(action)
+            if depth >= max_depth:
+                return
+            try:
+                count = int(node.get_child_count())
+                for index in range(count):
+                    child = node.get_child_at_index(index)
+                    if child is not None:
+                        visit(child, path + (index,), depth + 1)
+            except Exception:
+                return
+
+        visit(ref.window, (), 0)
+        return result
+
+    def invoke_action(
+        self,
+        window_id: str,
+        action_name: str | int,
+        *,
+        path: list[int] | tuple[int, ...] | None = None,
+        max_depth: int = 6,
+    ) -> dict[str, Any]:
+        """Invoke an AT-SPI action by name or index, without pointer coordinates."""
+
+        ref = self._ref(window_id)
+        node = ref.window
+        selected_path = tuple(int(value) for value in (path or ()))
+        try:
+            for child_index in selected_path:
+                node = node.get_child_at_index(child_index)
+                if node is None:
+                    raise SurfaceNotFound(f"AT-SPI child path does not exist: {list(selected_path)}")
+        except SurfaceNotFound:
+            raise
+        except Exception as exc:
+            raise SurfaceNotFound(f"AT-SPI child path does not exist: {list(selected_path)}") from exc
+
+        available = _actions(node)
+        chosen_index: int | None = None
+        if isinstance(action_name, int):
+            chosen_index = action_name if any(item["index"] == action_name for item in available) else None
+        else:
+            wanted = action_name.casefold()
+            for item in available:
+                if wanted in {
+                    str(item["name"]).casefold(),
+                    str(item["description"]).casefold(),
+                    str(item["keybinding"]).casefold(),
+                }:
+                    chosen_index = int(item["index"])
+                    break
+        if chosen_index is None:
+            raise SurfaceNotFound(
+                f"AT-SPI action {action_name!r} was not found on {str(node.get_name() or '')!r}; "
+                f"available={[item['name'] for item in available]}"
+            )
+        try:
+            action = node.get_action()
+            invoked = bool(action.do_action(chosen_index))
+        except Exception as exc:
+            raise BackendUnavailable(f"AT-SPI action {action_name!r} failed: {exc}") from exc
+        if not invoked:
+            raise BackendUnavailable(f"AT-SPI action {action_name!r} declined by the application")
+        return {
+            "ok": True,
+            "window_id": window_id,
+            "action": action_name,
+            "index": chosen_index,
+            "path": list(selected_path),
+            "max_depth": max_depth,
+        }
+
     def focused_text(self) -> tuple[WindowInfo, str] | None:
         windows = self.list_windows()
         fallback: tuple[WindowInfo, str] | None = None
@@ -336,6 +454,7 @@ class AtspiWindowSource:
                 "role": str(node.get_role_name() or ""),
                 "interfaces": interfaces,
                 "text": _text(node, self._atspi, limit=800),
+                "actions": _actions(node),
             }
             if depth < max_depth:
                 children = []
